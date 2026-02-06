@@ -35,7 +35,7 @@ install:
 	chmod +x $(BINDIR)/vimban*
 	cp share/vimban/templates/*.md $(SHAREDIR)/templates/
 	@if [ ! -f $(CONFIGDIR)/config.yaml ]; then \
-		cp .config/vimban/config.yaml.example $(CONFIGDIR)/config.yaml; \
+		cp examples/config.yaml.example $(CONFIGDIR)/config.yaml; \
 		echo "Created default config at $(CONFIGDIR)/config.yaml"; \
 	else \
 		echo "Config already exists at $(CONFIGDIR)/config.yaml (not overwritten)"; \

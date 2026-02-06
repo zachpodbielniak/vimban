@@ -90,7 +90,7 @@ Copy the example config and customize:
 
 ```bash
 mkdir -p ~/.config/vimban
-cp .config/vimban/config.yaml.example ~/.config/vimban/config.yaml
+cp examples/config.yaml.example ~/.config/vimban/config.yaml
 ```
 
 Key settings:

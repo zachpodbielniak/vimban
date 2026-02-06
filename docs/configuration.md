@@ -4,12 +4,12 @@ Vimban uses a layered configuration system: environment variables take precedenc
 
 ## Config File
 
-The config file lives at `~/.config/vimban/config.yaml`. An example is provided at `.config/vimban/config.yaml.example` in the repo.
+The config file lives at `~/.config/vimban/config.yaml`. An example is provided at `examples/config.yaml.example` in the repo.
 
 ```bash
 # Create your config
 mkdir -p ~/.config/vimban
-cp .config/vimban/config.yaml.example ~/.config/vimban/config.yaml
+cp examples/config.yaml.example ~/.config/vimban/config.yaml
 ```
 
 ## Environment Variables
