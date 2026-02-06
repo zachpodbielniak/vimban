@@ -80,7 +80,8 @@ default_scope: "personal"
 # ============================================================================
 
 # Distrobox container name for auto re-exec
-# Set to empty string or use NO_DBOX_CHECK=1 to disable
+# Set to "false", "none", "disabled", or "off" to disable re-exec entirely
+# Or use NO_DBOX_CHECK=1 env var to skip for a single invocation
 # Env: VIMBAN_DISTROBOX
 # Default: dev
 distrobox: "dev"

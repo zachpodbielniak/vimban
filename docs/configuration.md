@@ -76,7 +76,34 @@ Templates are searched in this order:
 
 Vimban and the TUI auto-detect if they're running outside the target distrobox container and re-exec inside it. This ensures Python dependencies are available.
 
-To disable this behavior:
+The distrobox target is resolved in this order:
+1. `VIMBAN_DISTROBOX` environment variable
+2. `distrobox` key in `~/.config/vimban/config.yaml`
+3. Default: `dev`
+
+### Change the target container
+
+```yaml
+# In ~/.config/vimban/config.yaml
+distrobox: "my-container"
+```
+
+Or via environment variable:
+
+```bash
+export VIMBAN_DISTROBOX="my-container"
+```
+
+### Disable distrobox re-exec entirely
+
+Set `distrobox` to `false`, `none`, `disabled`, or `off` in config:
+
+```yaml
+# In ~/.config/vimban/config.yaml
+distrobox: "false"
+```
+
+Or via environment variable:
 
 ```bash
 # Skip for a single command
@@ -84,9 +111,6 @@ NO_DBOX_CHECK=1 vimban list
 
 # Disable permanently
 export NO_DBOX_CHECK=1
-
-# Or change the target container
-export VIMBAN_DISTROBOX="my-container"
 ```
 
 ## Scope System

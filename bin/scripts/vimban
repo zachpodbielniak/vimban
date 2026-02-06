@@ -37,8 +37,41 @@ Examples:
 # DISTROBOX CHECK (Before any other imports)
 # ============================================================================
 from os import environ
+from pathlib import Path as _Path
 from subprocess import run
 from sys import argv, exit
+
+
+def _read_config_value(key: str, default: str = "") -> str:
+    """
+    Read a single top-level key from config.yaml using stdlib only.
+
+    This runs before yaml is imported so we do a simple line-based
+    parse. Only handles top-level scalar values (key: value).
+
+    Args:
+        key: The YAML key to look up
+        default: Fallback if key is not found
+
+    Returns:
+        The value as a string, or default
+    """
+    config_path: _Path = _Path.home() / ".config" / "vimban" / "config.yaml"
+    if not config_path.exists():
+        return default
+    try:
+        with open(config_path, "r") as f:
+            for line in f:
+                stripped: str = line.strip()
+                if stripped.startswith("#") or ":" not in stripped:
+                    continue
+                k, _, v = stripped.partition(":")
+                if k.strip() == key:
+                    val: str = v.strip().strip('"').strip("'")
+                    return val if val else default
+    except (OSError, ValueError):
+        pass
+    return default
 
 
 ctr_id: str | None = ""
@@ -46,12 +79,18 @@ ctr_id: str | None = ""
 if ("CONTAINER_ID" in environ):
     ctr_id = environ.get("CONTAINER_ID")
 
-# Check if distrobox check should be skipped
+# Check if distrobox check should be skipped via env or config
 no_dbox_check = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check:
+    _cfg_dbox: str = _read_config_value("distrobox", "")
+    if _cfg_dbox.lower() in ("", "false", "none", "disabled", "off"):
+        no_dbox_check = True
+
+# Determine target container: env > config > default "dev"
+_dbox_target: str = environ.get("VIMBAN_DISTROBOX", "") or _read_config_value("distrobox", "dev")
 
 # if we are not in the target distrobox re-exec the script
 # inside of the target distrobox
-_dbox_target: str = environ.get("VIMBAN_DISTROBOX", "dev")
 if not no_dbox_check and (_dbox_target != ctr_id):
     cmd: list[str] = [
         "distrobox",
