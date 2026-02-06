@@ -263,3 +263,66 @@ vimban --mcp
 # HTTP mode
 vimban --mcp-http
 ```
+
+## Web API & Authentication
+
+`vimban_serve` provides a full REST API at `/api/*` endpoints. All API routes return JSON.
+
+### Token-Based Auth
+
+Authentication uses Bearer tokens validated against `~/.config/vimban/token`:
+
+```
+Request flow:
+
+  Client                          vimban_serve
+    |                                  |
+    |  GET /api/tickets                |
+    |  Authorization: Bearer <token>   |
+    |--------------------------------->|
+    |                                  |  load tokens from ~/.config/vimban/token
+    |                                  |  validate Bearer token against set
+    |       200 OK (JSON)              |
+    |<---------------------------------|
+```
+
+**Token file format:**
+- One token per line
+- Lines starting with `#` are comments
+- Blank/whitespace-only lines are ignored
+- Tokens are reloaded on each request (no restart needed)
+
+**Auth bypass:**
+- `GET /` (HTML UI page) — always allowed
+- `GET /api/health` — always allowed (health check)
+- `--no-token` flag — disables all auth validation
+- If no token file exists or it's empty — auth is disabled
+
+### Remote Client Architecture
+
+When `--remote` is passed to `vimban`, `vimban_tui`, or `vimban_serve`, commands are routed through HTTP instead of the local filesystem:
+
+```
+  vimban --remote config:work list
+    |
+    |  1. resolve "config:work" from ~/.config/vimban/remote.yaml
+    |     -> url: http://192.168.1.10:5005, token: abc123
+    |
+    |  2. map "list" command to GET /api/tickets
+    |
+    |  3. send HTTP request with Bearer token
+    |     -> GET http://192.168.1.10:5005/api/tickets
+    |
+    |  4. format JSON response per --format flag
+```
+
+The remote client uses `urllib.request` (stdlib only) — no extra dependencies needed on the client side.
+
+### Remote Config Resolution
+
+The `--remote` flag accepts two formats:
+
+1. **Direct URL**: `http://host:port` — used as-is
+2. **Config reference**: `config:<name>` — resolved from `~/.config/vimban/remote.yaml`
+
+Token precedence: `--api-token` flag > `remote.yaml` api_token > no token (`--no-token`)

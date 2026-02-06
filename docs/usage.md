@@ -256,6 +256,77 @@ Default port is 5005. Override via `server_port` in config.yaml or `--port` flag
 
 Requires `quart` and `quart-cors` Python packages.
 
+### Token Authentication
+
+The web server supports token-based authentication. Create a token file at `~/.config/vimban/token` with one token per line:
+
+```
+# Lines starting with # are comments
+my-secret-token-123
+another-valid-token
+```
+
+When the token file exists and contains valid tokens, all `/api/*` endpoints require a `Bearer` token in the `Authorization` header. The `/api/health` endpoint is always unauthenticated.
+
+```bash
+# Start with auth (auto-detected from token file)
+vimban_serve
+
+# Disable auth for testing
+vimban_serve --no-token
+
+# Test the API
+curl -H "Authorization: Bearer my-secret-token-123" http://localhost:5005/api/tickets
+```
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/health` | Health check (unauthenticated) |
+| GET | `/api/tickets` | List tickets (supports query params) |
+| POST | `/api/tickets` | Create a ticket |
+| GET | `/api/ticket/<id>` | Get a single ticket |
+| POST | `/api/ticket/<id>/move` | Move ticket to new status |
+| POST | `/api/ticket/<id>/comment` | Add a comment |
+| GET | `/api/ticket/<id>/comments` | Get ticket comments |
+| POST | `/api/ticket/<id>/edit` | Edit ticket fields |
+| POST | `/api/ticket/<id>/archive` | Archive a ticket |
+| POST | `/api/ticket/<id>/link` | Link tickets |
+| GET | `/api/dashboard/<type>` | Get dashboard data |
+| GET | `/api/kanban` | Get kanban board as JSON |
+| GET | `/api/people` | List people |
+| GET | `/api/search?q=<query>` | Search tickets |
+| GET | `/api/report` | Get report data |
+| POST | `/api/sync` | Git sync |
+| POST | `/api/commit` | Git commit (with optional pull) |
+
+## Remote Access
+
+Connect to a remote `vimban_serve` instance from any machine:
+
+```bash
+# Connect using a direct URL
+vimban --remote http://192.168.1.10:5005 --api-token mytoken list
+
+# Use a named remote from ~/.config/vimban/remote.yaml
+vimban --remote config:work list
+vimban --remote config:work show PROJ-00042
+
+# Create a ticket on the remote
+vimban --remote config:work create task "Fix the thing" -p high
+
+# TUI connected to remote server
+vimban_tui --remote config:work
+
+# Skip auth for local testing
+vimban --remote http://localhost:5005 --no-token list
+```
+
+Supported commands in remote mode: `list`, `show`, `create`, `move`, `archive`, `comment`, `comments`, `edit`, `search`, `dashboard`, `kanban`, `people`, `report`, `sync`, `commit`, `link`.
+
+See `docs/configuration.md` for remote.yaml format and token file setup.
+
 ## MCP Server
 
 Vimban can run as an MCP (Model Context Protocol) server for AI assistant integration:
@@ -282,6 +353,9 @@ These flags work with any command:
 | `--work` | Force work scope |
 | `--personal` | Force personal scope |
 | `--archived` | Include archived tickets |
+| `--remote URL` | Connect to remote vimban_serve (URL or `config:<name>`) |
+| `--api-token TOKEN` | API token for remote server |
+| `--no-token` | Skip auth when connecting to remote |
 | `--version` | Show version |
 | `--license` | Show license |
 | `-h, --help` | Show help |

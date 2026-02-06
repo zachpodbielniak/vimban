@@ -115,6 +115,9 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
@@ -182,6 +185,374 @@ def _resolve_template_dir() -> Path:
 
     # fallback to submodule path (will fail gracefully later if missing)
     return submod
+
+
+# ============================================================================
+# REMOTE API CLIENT
+# ============================================================================
+REMOTE_CONFIG_FILE: Path = Path.home() / ".config" / "vimban" / "remote.yaml"
+
+
+def _resolve_remote(remote_str: str) -> tuple[str, str | None]:
+    """
+    Resolve a --remote value to (url, token).
+
+    Supports:
+        - Direct URL: "http://host:5005" or "https://host:5005/path"
+        - Config lookup: "config:<name>" reads ~/.config/vimban/remote.yaml
+
+    Args:
+        remote_str: The --remote argument value
+
+    Returns:
+        Tuple of (base_url, api_token_or_None)
+    """
+    if remote_str.startswith("config:"):
+        name: str = remote_str[7:]
+        if not REMOTE_CONFIG_FILE.exists():
+            print(f"Error: remote config file not found: {REMOTE_CONFIG_FILE}", file=sys.stderr)
+            sys.exit(1)
+        with open(REMOTE_CONFIG_FILE, "r") as f:
+            data: dict = yaml.safe_load(f) or {}
+        if name not in data:
+            print(f"Error: remote '{name}' not found in {REMOTE_CONFIG_FILE}", file=sys.stderr)
+            print(f"Available remotes: {', '.join(data.keys())}", file=sys.stderr)
+            sys.exit(1)
+        entry: dict = data[name]
+        url: str = entry.get("url", "")
+        token: str | None = entry.get("api_token", None)
+        if not url:
+            print(f"Error: remote '{name}' has no url defined", file=sys.stderr)
+            sys.exit(1)
+        return (url.rstrip("/"), token)
+    else:
+        return (remote_str.rstrip("/"), None)
+
+
+def _remote_request(
+    base_url: str,
+    method: str,
+    path: str,
+    token: str | None = None,
+    data: dict | None = None,
+    params: dict | None = None,
+) -> dict:
+    """
+    Make an HTTP request to a remote vimban_serve instance.
+
+    Uses urllib.request (stdlib only) to avoid extra dependencies.
+
+    Args:
+        base_url: Base URL of the remote server (e.g. http://host:5005)
+        method: HTTP method (GET, POST)
+        path: API path (e.g. /api/tickets)
+        token: Bearer token for auth (None to skip)
+        data: JSON body for POST requests
+        params: Query parameters for GET requests
+
+    Returns:
+        Parsed JSON response dict
+
+    Raises:
+        SystemExit on connection errors or auth failures
+    """
+    url: str = f"{base_url}{path}"
+    if params:
+        query: str = urllib.parse.urlencode(
+            {k: v for k, v in params.items() if v}
+        )
+        if query:
+            url = f"{url}?{query}"
+
+    body: bytes | None = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+
+    req: urllib.request.Request = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_data: bytes = resp.read()
+            return json.loads(resp_data)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print("Error: authentication failed (401 Unauthorized)", file=sys.stderr)
+            print("Check your API token or use --no-token if auth is disabled on the server", file=sys.stderr)
+            sys.exit(1)
+        elif e.code == 404:
+            print(f"Error: not found (404): {path}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            body_text: str = ""
+            try:
+                body_text = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            print(f"Error: HTTP {e.code}: {body_text}", file=sys.stderr)
+            sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Error: cannot connect to {base_url}: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: request failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _remote_dispatch(args: argparse.Namespace, remote_url: str, token: str | None) -> int:
+    """
+    Dispatch a CLI command through the remote API.
+
+    Maps each CLI command to the corresponding vimban_serve API endpoint,
+    sends the request, and formats the output according to args.format.
+
+    Args:
+        args: Parsed argparse namespace with command and subcommand args
+        remote_url: Base URL of the remote vimban_serve
+        token: Bearer token (or None for --no-token)
+
+    Returns:
+        Exit code (0 for success)
+    """
+    command: str = args.command
+    fmt: str = getattr(args, "format", "plain")
+
+    if command == "list":
+        params: dict[str, str] = {}
+        if getattr(args, "status", None):
+            params["status"] = args.status
+        if getattr(args, "type", None):
+            params["type"] = args.type
+        if getattr(args, "assignee", None):
+            params["assignee"] = args.assignee
+        if getattr(args, "priority", None):
+            params["priority"] = args.priority
+        if getattr(args, "project", None):
+            params["project"] = args.project
+        if getattr(args, "work", False):
+            params["scope"] = "work"
+        elif getattr(args, "personal", False):
+            params["scope"] = "personal"
+        if getattr(args, "archived", False):
+            params["include_done"] = "true"
+
+        resp: dict = _remote_request(remote_url, "GET", "/api/tickets", token, params=params)
+        tickets: list = resp.get("tickets", [])
+        _output_remote_data(tickets, fmt, "list")
+        return 0
+
+    elif command == "show":
+        ticket_id: str = getattr(args, "ticket_id", "") or getattr(args, "id", "")
+        resp = _remote_request(remote_url, "GET", f"/api/ticket/{ticket_id}", token)
+        ticket: dict = resp.get("ticket", {})
+        _output_remote_data(ticket, fmt, "show")
+        return 0
+
+    elif command == "create":
+        create_data: dict = {
+            "type": getattr(args, "type", "task"),
+            "title": getattr(args, "title", ""),
+            "priority": getattr(args, "priority", "medium") or "medium",
+        }
+        if getattr(args, "assignee", None):
+            create_data["assignee"] = args.assignee
+        if getattr(args, "reporter", None):
+            create_data["reporter"] = args.reporter
+        if getattr(args, "project", None):
+            create_data["project"] = args.project
+        if getattr(args, "tags", None):
+            create_data["tags"] = args.tags
+        if getattr(args, "due", None):
+            create_data["due"] = args.due
+        if getattr(args, "member_of", None):
+            create_data["member_of"] = ",".join(args.member_of)
+        if getattr(args, "work", False):
+            create_data["scope"] = "work"
+        elif getattr(args, "personal", False):
+            create_data["scope"] = "personal"
+
+        resp = _remote_request(remote_url, "POST", "/api/tickets", token, data=create_data)
+        if resp.get("success"):
+            print(resp.get("id", "Created"))
+        else:
+            print(f"Error: {resp.get('message', 'Failed')}", file=sys.stderr)
+            return 1
+        return 0
+
+    elif command == "move":
+        ticket_id = getattr(args, "ticket_id", "") or getattr(args, "id", "")
+        new_status: str = getattr(args, "status", "") or getattr(args, "new_status", "")
+        resp = _remote_request(remote_url, "POST", f"/api/ticket/{ticket_id}/move", token, data={"status": new_status})
+        print(resp.get("message", ""))
+        return 0 if resp.get("success") else 1
+
+    elif command == "archive":
+        ticket_id = getattr(args, "ticket_id", "") or getattr(args, "id", "")
+        resp = _remote_request(remote_url, "POST", f"/api/ticket/{ticket_id}/archive", token)
+        print(resp.get("message", ""))
+        return 0 if resp.get("success") else 1
+
+    elif command == "comment":
+        ticket_id = getattr(args, "ticket_id", "") or getattr(args, "id", "")
+        text: str = getattr(args, "text", "") or getattr(args, "message", "")
+        resp = _remote_request(remote_url, "POST", f"/api/ticket/{ticket_id}/comment", token, data={"text": text})
+        print(resp.get("message", ""))
+        return 0 if resp.get("success") else 1
+
+    elif command == "comments":
+        ticket_id = getattr(args, "ticket_id", "") or getattr(args, "id", "")
+        resp = _remote_request(remote_url, "GET", f"/api/ticket/{ticket_id}/comments", token)
+        comments: list = resp.get("comments", [])
+        _output_remote_data(comments, fmt, "comments")
+        return 0
+
+    elif command == "edit":
+        ticket_id = getattr(args, "ticket_id", "") or getattr(args, "id", "")
+        edit_data: dict = {}
+        if getattr(args, "priority", None):
+            edit_data["priority"] = args.priority
+        if getattr(args, "assignee", None):
+            edit_data["assignee"] = args.assignee
+        if getattr(args, "progress", None):
+            edit_data["progress"] = args.progress
+        if getattr(args, "tags", None):
+            edit_data["tags"] = args.tags
+        if getattr(args, "due", None):
+            edit_data["due_date"] = args.due
+        resp = _remote_request(remote_url, "POST", f"/api/ticket/{ticket_id}/edit", token, data=edit_data)
+        print(resp.get("message", ""))
+        return 0 if resp.get("success") else 1
+
+    elif command == "search":
+        query: str = getattr(args, "query", "") or getattr(args, "pattern", "")
+        resp = _remote_request(remote_url, "GET", "/api/search", token, params={"q": query})
+        tickets = resp.get("tickets", [])
+        _output_remote_data(tickets, fmt, "list")
+        return 0
+
+    elif command == "dashboard":
+        dtype: str = getattr(args, "type", "daily") or "daily"
+        resp = _remote_request(remote_url, "GET", f"/api/dashboard/{dtype}", token)
+        print(resp.get("content", ""))
+        return 0
+
+    elif command == "kanban":
+        resp = _remote_request(remote_url, "GET", "/api/kanban", token)
+        board: dict = resp.get("board", {})
+        if fmt == "json":
+            print(json.dumps(board, indent=2))
+        else:
+            for status_name, items in board.items():
+                if items:
+                    print(f"\n=== {status_name.upper()} ({len(items)}) ===")
+                    for t in items:
+                        tid: str = t.get("id", "?")
+                        title: str = t.get("title", "")
+                        print(f"  {tid}: {title}")
+        return 0
+
+    elif command == "people":
+        resp = _remote_request(remote_url, "GET", "/api/people", token)
+        people: list = resp.get("people", [])
+        _output_remote_data(people, fmt, "people")
+        return 0
+
+    elif command == "report":
+        rtype: str = getattr(args, "type", "summary") or "summary"
+        resp = _remote_request(remote_url, "GET", "/api/report", token, params={"type": rtype})
+        if resp.get("format") == "json":
+            _output_remote_data(resp.get("report", {}), fmt, "report")
+        else:
+            print(resp.get("content", ""))
+        return 0
+
+    elif command in ("sync", "commit"):
+        pull: bool = getattr(args, "pull", False)
+        resp = _remote_request(remote_url, "POST", "/api/commit", token, data={"pull": pull})
+        print(resp.get("message", ""))
+        return 0 if resp.get("success") else 1
+
+    elif command == "link":
+        ticket_id = getattr(args, "ticket_id", "") or getattr(args, "source", "")
+        target: str = getattr(args, "target", "")
+        link_type: str = getattr(args, "type", "related") or "related"
+        resp = _remote_request(
+            remote_url, "POST", f"/api/ticket/{ticket_id}/link", token,
+            data={"target": target, "type": link_type}
+        )
+        print(resp.get("message", ""))
+        return 0 if resp.get("success") else 1
+
+    else:
+        print(f"Error: command '{command}' is not supported in remote mode", file=sys.stderr)
+        print("Supported remote commands: list, show, create, move, archive, comment,", file=sys.stderr)
+        print("  comments, edit, search, dashboard, kanban, people, report, sync, commit, link", file=sys.stderr)
+        return 1
+
+
+def _output_remote_data(data: Any, fmt: str, context: str) -> None:
+    """
+    Format and print data received from a remote API response.
+
+    Args:
+        data: The data to output (list, dict, etc.)
+        fmt: Output format (plain, json, yaml, md)
+        context: Context hint (list, show, comments, people, report)
+    """
+    if fmt == "json":
+        print(json.dumps(data, indent=2))
+    elif fmt == "yaml":
+        print(yaml.dump(data, default_flow_style=False))
+    elif fmt == "md":
+        # markdown table for lists
+        if isinstance(data, list) and data:
+            if context in ("list", "comments", "people"):
+                keys: list[str] = list(data[0].keys()) if data else []
+                if keys:
+                    print("| " + " | ".join(keys) + " |")
+                    print("| " + " | ".join(["---"] * len(keys)) + " |")
+                    for item in data:
+                        vals: list[str] = [str(item.get(k, "")) for k in keys]
+                        print("| " + " | ".join(vals) + " |")
+            else:
+                print(json.dumps(data, indent=2))
+        elif isinstance(data, dict):
+            for k, v in data.items():
+                print(f"**{k}**: {v}")
+        else:
+            print(str(data))
+    else:
+        # plain text
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    tid: str = item.get("id", "")
+                    title: str = item.get("title", "")
+                    status: str = item.get("status", "")
+                    priority: str = item.get("priority", "")
+                    if context == "list":
+                        print(f"{tid}  {status:<12} {priority:<8} {title}")
+                    elif context == "comments":
+                        author: str = item.get("author", "")
+                        ts: str = item.get("timestamp", "")
+                        body: str = item.get("text", item.get("body", ""))
+                        print(f"[{ts}] {author}: {body}")
+                    elif context == "people":
+                        name: str = item.get("name", item.get("id", ""))
+                        role: str = item.get("role", "")
+                        print(f"{name}  {role}")
+                    else:
+                        print(str(item))
+                else:
+                    print(str(item))
+        elif isinstance(data, dict):
+            for k, v in data.items():
+                print(f"{k}: {v}")
+        else:
+            print(str(data))
 
 
 # ============================================================================
@@ -9312,6 +9683,14 @@ Environment Variables:
     parser.add_argument('--archived', action='store_true',
                         help='Include items from 04_archives/ (excluded by default)')
 
+    # Remote API flags (global)
+    parser.add_argument('--remote',
+                        help='Connect to remote vimban_serve (URL or config:<name>)')
+    parser.add_argument('--api-token',
+                        help='API token for remote server authentication')
+    parser.add_argument('--no-token', action='store_true',
+                        help='Skip sending auth token to remote server')
+
     # Subparsers
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -9703,6 +10082,17 @@ def main() -> int:
     if not command:
         parser.print_help()
         return EXIT_SUCCESS
+
+    # remote mode: route through vimban_serve API instead of local filesystem
+    if getattr(args, 'remote', None):
+        remote_url, remote_token = _resolve_remote(args.remote)
+        # --api-token overrides token from remote.yaml
+        if getattr(args, 'api_token', None):
+            remote_token = args.api_token
+        # --no-token means don't send any auth
+        if getattr(args, 'no_token', False):
+            remote_token = None
+        return _remote_dispatch(args, remote_url, remote_token)
 
     commands = {
         'init': cmd_init,

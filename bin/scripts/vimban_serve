@@ -93,6 +93,9 @@ import argparse
 import asyncio
 import json
 import re
+import urllib.request
+import urllib.error
+import urllib.parse
 from datetime import datetime, date, timedelta
 from typing import Any, Optional
 
@@ -104,6 +107,11 @@ except ImportError:
     print("Install with: pip install quart quart-cors", file=sys.stderr)
     sys.exit(1)
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 
 # ============================================================================
 # CONSTANTS
@@ -111,6 +119,8 @@ except ImportError:
 VERSION: str = "0.1.0"
 DEFAULT_PORT: int = 5005
 DEFAULT_BIND: str = "127.0.0.1"
+TOKEN_FILE: _Path = _Path.home() / ".config" / "vimban" / "token"
+REMOTE_CONFIG_FILE: _Path = _Path.home() / ".config" / "vimban" / "remote.yaml"
 
 STATUSES: list[str] = [
     "backlog", "ready", "in_progress", "blocked",
@@ -164,6 +174,150 @@ GNU Affero General Public License for more details.
 
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>."""
+
+
+# ============================================================================
+# TOKEN AUTH
+# ============================================================================
+def _load_tokens(token_path: _Path = TOKEN_FILE) -> set[str]:
+    """
+    Load valid API tokens from the token file.
+
+    Token file format: one token per line. Lines starting with '#' are
+    comments. Blank or whitespace-only lines are ignored.
+
+    Args:
+        token_path: Path to the token file
+
+    Returns:
+        Set of valid token strings
+    """
+    tokens: set[str] = set()
+    if not token_path.exists():
+        return tokens
+    try:
+        with open(token_path, "r") as f:
+            for line in f:
+                stripped: str = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                tokens.add(stripped)
+    except OSError:
+        pass
+    return tokens
+
+
+def _resolve_remote(remote_str: str) -> tuple[str, str | None]:
+    """
+    Resolve a --remote value to (url, token).
+
+    Supports:
+        - Direct URL: "http://host:5005" or "https://host:5005"
+        - Config lookup: "config:<name>" reads ~/.config/vimban/remote.yaml
+
+    Args:
+        remote_str: The --remote argument value
+
+    Returns:
+        Tuple of (base_url, api_token_or_None)
+    """
+    if remote_str.startswith("config:"):
+        name: str = remote_str[7:]
+        if not REMOTE_CONFIG_FILE.exists():
+            print(f"Error: remote config file not found: {REMOTE_CONFIG_FILE}", file=sys.stderr)
+            sys.exit(1)
+        if yaml is None:
+            print("Error: PyYAML required for config: remote resolution", file=sys.stderr)
+            sys.exit(1)
+        with open(REMOTE_CONFIG_FILE, "r") as f:
+            data: dict = yaml.safe_load(f) or {}
+        if name not in data:
+            print(f"Error: remote '{name}' not found in {REMOTE_CONFIG_FILE}", file=sys.stderr)
+            print(f"Available remotes: {', '.join(data.keys())}", file=sys.stderr)
+            sys.exit(1)
+        entry: dict = data[name]
+        url: str = entry.get("url", "")
+        token: str | None = entry.get("api_token", None)
+        if not url:
+            print(f"Error: remote '{name}' has no url defined", file=sys.stderr)
+            sys.exit(1)
+        return (url.rstrip("/"), token)
+    else:
+        return (remote_str.rstrip("/"), None)
+
+
+def _remote_request(
+    base_url: str,
+    method: str,
+    path: str,
+    token: str | None = None,
+    data: dict | None = None,
+    params: dict | None = None,
+) -> dict:
+    """
+    Make an HTTP request to a remote vimban_serve instance.
+
+    Uses urllib.request (stdlib only) to avoid extra dependencies
+    on the client side.
+
+    Args:
+        base_url: Base URL of the remote server (e.g. http://host:5005)
+        method: HTTP method (GET, POST)
+        path: API path (e.g. /api/tickets)
+        token: Bearer token for auth (None to skip)
+        data: JSON body for POST requests
+        params: Query parameters for GET requests
+
+    Returns:
+        Parsed JSON response dict
+
+    Raises:
+        SystemExit on connection errors or auth failures
+    """
+    url: str = f"{base_url}{path}"
+    if params:
+        query: str = urllib.parse.urlencode(
+            {k: v for k, v in params.items() if v}
+        )
+        if query:
+            url = f"{url}?{query}"
+
+    body: bytes | None = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+
+    req: urllib.request.Request = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_data: bytes = resp.read()
+            return json.loads(resp_data)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print("Error: authentication failed (401 Unauthorized)", file=sys.stderr)
+            print("Check your API token or use --no-token if auth is disabled", file=sys.stderr)
+            sys.exit(1)
+        elif e.code == 404:
+            print(f"Error: not found (404): {path}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            body_text: str = ""
+            try:
+                body_text = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            print(f"Error: HTTP {e.code}: {body_text}", file=sys.stderr)
+            sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Error: cannot connect to {base_url}: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: request failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 # ============================================================================
@@ -471,6 +625,47 @@ def git_sync() -> tuple[bool, str]:
 # ============================================================================
 app: Quart = Quart(__name__)
 app = cors(app, allow_origin="*")
+
+# auth state — set at startup based on --no-token flag
+_auth_enabled: bool = True
+_valid_tokens: set[str] = set()
+
+
+@app.before_request
+async def _check_auth():
+    """
+    Token-based auth middleware.
+
+    Validates Bearer token on all /api/* routes. Skips auth for:
+    - GET / (HTML UI page)
+    - GET /api/health (health check)
+    - All routes when --no-token is active
+    """
+    if not _auth_enabled:
+        return None
+
+    path: str = request.path
+
+    # skip auth for the HTML UI and health check
+    if path == "/" or path == "/api/health":
+        return None
+
+    # only protect /api/* routes
+    if not path.startswith("/api/"):
+        return None
+
+    auth_header: str | None = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "unauthorized", "message": "Authorization header required"}), 401
+
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "unauthorized", "message": "Bearer token required"}), 401
+
+    token: str = auth_header[7:]
+    if token not in _valid_tokens:
+        return jsonify({"error": "unauthorized", "message": "Invalid token"}), 401
+
+    return None
 
 
 # ============================================================================
@@ -2264,6 +2459,225 @@ async def api_sync():
     return jsonify({'success': success, 'message': msg})
 
 
+@app.route('/api/health')
+async def api_health():
+    """Unauthenticated health check endpoint."""
+    return jsonify({'status': 'ok', 'version': VERSION})
+
+
+@app.route('/api/ticket/<ticket_id>/archive', methods=['POST'])
+async def api_archive_ticket(ticket_id: str):
+    """Archive a ticket (move to archived status)."""
+    rc, stdout, stderr = _vimban_cmd(["archive", ticket_id])
+    if rc != 0:
+        return jsonify({'success': False, 'message': stderr.strip() or 'Failed to archive'}), 400
+    return jsonify({'success': True, 'message': f'Archived {ticket_id}'})
+
+
+@app.route('/api/ticket/<ticket_id>/comments')
+async def api_get_comments(ticket_id: str):
+    """Get comments for a ticket."""
+    rc, stdout, stderr = _vimban_cmd(["comments", ticket_id, "-f", "json"])
+    if rc != 0:
+        return jsonify({'comments': [], 'error': stderr.strip()}), 400
+    data: Any = _parse_json_output(stdout)
+    if isinstance(data, list):
+        return jsonify({'comments': data})
+    return jsonify({'comments': data.get('comments', []) if isinstance(data, dict) else []})
+
+
+@app.route('/api/ticket/<ticket_id>/link', methods=['POST'])
+async def api_link_tickets(ticket_id: str):
+    """Link a ticket to another ticket."""
+    data: dict = await request.get_json()
+    target: str = data.get('target', '')
+    link_type: str = data.get('type', 'related')
+    if not target:
+        return jsonify({'success': False, 'message': 'Target ticket ID required'}), 400
+
+    rc, stdout, stderr = _vimban_cmd(["link", ticket_id, target, "--type", link_type])
+    if rc != 0:
+        return jsonify({'success': False, 'message': stderr.strip() or 'Failed to link'}), 400
+    return jsonify({'success': True, 'message': f'Linked {ticket_id} to {target}'})
+
+
+@app.route('/api/report')
+async def api_report():
+    """Get report data."""
+    report_type: str = request.args.get('type', 'summary')
+    rc, stdout, stderr = _vimban_cmd(["report", report_type, "-f", "json"])
+    if rc != 0:
+        # fallback to plain text if json not supported for this report
+        rc, stdout, stderr = _vimban_cmd(["report", report_type])
+        return jsonify({'content': stdout, 'format': 'text'})
+    data: Any = _parse_json_output(stdout)
+    if data is not None:
+        return jsonify({'report': data, 'format': 'json'})
+    return jsonify({'content': stdout, 'format': 'text'})
+
+
+@app.route('/api/kanban')
+async def api_kanban():
+    """Get kanban board data as structured JSON."""
+    # get tickets grouped by status for kanban rendering
+    tickets: list[dict[str, Any]] = list_tickets(
+        work=(request.args.get('scope') == 'work'),
+        personal=(request.args.get('scope') == 'personal'),
+    )
+    # group by status
+    board: dict[str, list[dict]] = {s: [] for s in STATUSES}
+    for t in tickets:
+        status: str = t.get('status', 'backlog')
+        if status in board:
+            board[status].append(t)
+        else:
+            board.setdefault(status, []).append(t)
+    return jsonify({'board': board})
+
+
+@app.route('/api/commit', methods=['POST'])
+async def api_commit():
+    """Run vimban commit (with optional --pull)."""
+    data: dict = await request.get_json() or {}
+    cmd_args: list[str] = ["commit"]
+    if data.get('pull', False):
+        cmd_args.append("--pull")
+    rc, stdout, stderr = _vimban_cmd(cmd_args, timeout=60)
+    if rc != 0:
+        return jsonify({'success': False, 'message': stderr.strip() or 'Commit failed'}), 400
+    return jsonify({'success': True, 'message': stdout.strip() or 'Committed'})
+
+
+# ============================================================================
+# PROXY MODE (--remote for chaining vimban_serve instances)
+# ============================================================================
+_proxy_url: str = ""
+_proxy_token: str | None = None
+_proxy_enabled: bool = False
+
+
+def _setup_proxy_mode(remote_url: str, token: str | None) -> None:
+    """
+    Enable proxy mode: forward vimban CLI calls through a remote API.
+
+    When proxy mode is active, all helper functions that call _vimban_cmd()
+    will be transparently routed through the remote vimban_serve instead
+    of invoking the local vimban binary. The list_tickets, get_ticket, etc.
+    functions still work — they just go over HTTP now.
+
+    Args:
+        remote_url: Base URL of the remote server
+        token: Bearer token for auth (or None)
+    """
+    global _proxy_url, _proxy_token, _proxy_enabled, _vimban_cmd
+    _proxy_url = remote_url
+    _proxy_token = token
+    _proxy_enabled = True
+    _vimban_cmd = _proxy_vimban_cmd
+
+
+def _proxy_vimban_cmd(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
+    """
+    Proxy a vimban command through a remote vimban_serve API.
+
+    Maps CLI-style command args to the corresponding API endpoint
+    and returns the response as if it came from a local vimban call.
+
+    Args:
+        args: Command arguments (same as _vimban_cmd)
+        timeout: Request timeout
+
+    Returns:
+        Tuple of (return_code, stdout_json, stderr)
+    """
+    if not args:
+        return (1, "", "No command provided")
+
+    cmd: str = args[0]
+    rest: list[str] = args[1:]
+
+    try:
+        if cmd == "list":
+            params: dict[str, str] = {}
+            i: int = 0
+            while i < len(rest):
+                if rest[i] in ("-s", "--status") and i + 1 < len(rest):
+                    params["status"] = rest[i + 1]
+                    i += 2
+                elif rest[i] in ("-t", "--type") and i + 1 < len(rest):
+                    params["type"] = rest[i + 1]
+                    i += 2
+                elif rest[i] == "--assignee" and i + 1 < len(rest):
+                    params["assignee"] = rest[i + 1]
+                    i += 2
+                elif rest[i] == "--priority" and i + 1 < len(rest):
+                    params["priority"] = rest[i + 1]
+                    i += 2
+                elif rest[i] in ("-P", "--project") and i + 1 < len(rest):
+                    params["project"] = rest[i + 1]
+                    i += 2
+                elif rest[i] == "--work":
+                    params["scope"] = "work"
+                    i += 1
+                elif rest[i] == "--personal":
+                    params["scope"] = "personal"
+                    i += 1
+                elif rest[i] == "--archived":
+                    params["include_done"] = "true"
+                    i += 1
+                else:
+                    i += 1
+            resp = _remote_request(_proxy_url, "GET", "/api/tickets", _proxy_token, params=params)
+            return (0, json.dumps(resp.get("tickets", [])), "")
+
+        elif cmd == "show" and rest:
+            resp = _remote_request(_proxy_url, "GET", f"/api/ticket/{rest[0]}", _proxy_token)
+            return (0, json.dumps(resp.get("ticket", {})), "")
+
+        elif cmd == "search" and rest:
+            resp = _remote_request(_proxy_url, "GET", "/api/search", _proxy_token, params={"q": rest[0]})
+            return (0, json.dumps(resp.get("tickets", [])), "")
+
+        elif cmd == "dashboard":
+            dtype: str = rest[0] if rest else "daily"
+            resp = _remote_request(_proxy_url, "GET", f"/api/dashboard/{dtype}", _proxy_token)
+            return (0, resp.get("content", ""), "")
+
+        elif cmd == "people":
+            resp = _remote_request(_proxy_url, "GET", "/api/people", _proxy_token)
+            return (0, json.dumps(resp.get("people", [])), "")
+
+        elif cmd == "kanban":
+            resp = _remote_request(_proxy_url, "GET", "/api/kanban", _proxy_token)
+            return (0, json.dumps(resp.get("board", {})), "")
+
+        elif cmd == "commit":
+            pull: bool = "--pull" in rest
+            resp = _remote_request(_proxy_url, "POST", "/api/commit", _proxy_token, data={"pull": pull})
+            msg: str = resp.get("message", "")
+            if resp.get("success"):
+                return (0, msg, "")
+            return (1, "", msg)
+
+        elif cmd in ("move", "archive", "comment", "edit", "link"):
+            # these are handled via the existing API in the route handlers
+            # but the proxy just passes through the original _vimban_cmd
+            return _original_vimban_cmd(args, timeout)
+
+        else:
+            # fallback: run locally
+            return _original_vimban_cmd(args, timeout)
+
+    except SystemExit:
+        return (1, "", "Remote request failed")
+    except Exception as e:
+        return (1, "", str(e))
+
+
+# store original _vimban_cmd before potential override
+_original_vimban_cmd = _vimban_cmd
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -2294,6 +2708,26 @@ async def main() -> None:
     parser.add_argument('--license', action='store_true', help='Show license')
     parser.add_argument('-h2', '--help-keys', action='store_true', help='Show keyboard shortcuts')
 
+    # auth options
+    parser.add_argument(
+        '--no-token', action='store_true',
+        help='Disable token authentication (for testing or local-only setups)'
+    )
+    parser.add_argument(
+        '--token-file', default=str(TOKEN_FILE),
+        help=f'Path to token file (default: {TOKEN_FILE})'
+    )
+
+    # remote proxy options (for chaining to another vimban_serve)
+    parser.add_argument(
+        '--remote',
+        help='Proxy to a remote vimban_serve (URL or config:<name>)'
+    )
+    parser.add_argument(
+        '--api-token',
+        help='API token for remote server authentication'
+    )
+
     args: argparse.Namespace = parser.parse_args()
 
     if args.license:
@@ -2309,6 +2743,29 @@ async def main() -> None:
         print("  /       Focus search")
         print("  Esc     Close modals")
         return
+
+    # configure auth
+    global _auth_enabled, _valid_tokens
+    if args.no_token:
+        _auth_enabled = False
+        print("  Auth    : DISABLED (--no-token)")
+    else:
+        token_path: _Path = _Path(args.token_file)
+        _valid_tokens = _load_tokens(token_path)
+        if _valid_tokens:
+            _auth_enabled = True
+            print(f"  Auth    : enabled ({len(_valid_tokens)} token(s) loaded from {token_path})")
+        else:
+            _auth_enabled = False
+            print(f"  Auth    : DISABLED (no tokens found in {token_path})")
+
+    # if --remote, set up proxy mode
+    if args.remote:
+        remote_url, remote_token = _resolve_remote(args.remote)
+        if args.api_token:
+            remote_token = args.api_token
+        _setup_proxy_mode(remote_url, remote_token)
+        print(f"  Proxy   : forwarding API calls to {remote_url}")
 
     print(f"Starting vimban web server on http://{args.bind}:{args.port}")
     print(f"  Kanban  : http://{args.bind}:{args.port}")

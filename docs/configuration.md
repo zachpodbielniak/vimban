@@ -122,3 +122,75 @@ Vimban supports `work` and `personal` scopes. Scope is detected from file paths:
 - Default scope when undetected: `personal`
 
 Override with `--work` or `--personal` flags on any command.
+
+## Remote API
+
+Vimban supports connecting to a remote `vimban_serve` instance instead of the local filesystem. This enables multi-machine workflows where one machine hosts the data and others interact with it over HTTP.
+
+### Token File
+
+The server reads tokens from `~/.config/vimban/token`:
+
+```
+# API tokens for vimban_serve authentication
+# One token per line. Lines starting with # are comments.
+# Blank lines are ignored.
+
+abc123-my-first-token
+def456-my-second-token
+```
+
+Start the server with token auth:
+
+```bash
+vimban_serve                   # auth enabled if token file exists
+vimban_serve --no-token        # auth disabled (for testing)
+vimban_serve --token-file /path/to/tokens
+```
+
+### Remote Configuration
+
+Named remotes are stored in `~/.config/vimban/remote.yaml`:
+
+```yaml
+work:
+  url: "http://192.168.1.10:5005"
+  api_token: "abc123-my-first-token"
+
+home:
+  url: "https://vimban.example.com:5005"
+  api_token: "def456-my-second-token"
+
+local:
+  url: "http://127.0.0.1:5005"
+  # no api_token — use with --no-token
+```
+
+### Remote Flags
+
+These flags work with `vimban`, `vimban_tui`, and `vimban_serve`:
+
+| Flag | Description |
+|------|-------------|
+| `--remote URL` | Connect to remote server (URL or `config:<name>`) |
+| `--api-token TOKEN` | API token (overrides remote.yaml token) |
+| `--no-token` | Skip sending auth header |
+
+### Examples
+
+```bash
+# Direct URL
+vimban --remote http://192.168.1.10:5005 --api-token abc123 list
+
+# Named remote from remote.yaml
+vimban --remote config:work list
+
+# No auth (local testing)
+vimban --remote http://localhost:5005 --no-token list
+
+# TUI connected to remote
+vimban_tui --remote config:work
+
+# Proxy one vimban_serve through another
+vimban_serve --remote config:work --port 8080
+```

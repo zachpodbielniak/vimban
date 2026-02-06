@@ -157,6 +157,8 @@ find_ticket = vimban.find_ticket
 find_person = vimban.find_person
 parse_frontmatter = vimban.parse_frontmatter
 dump_frontmatter = vimban.dump_frontmatter
+_resolve_remote = vimban._resolve_remote
+_remote_request = vimban._remote_request
 STATUSES = vimban.STATUSES
 TICKET_TYPES = vimban.TICKET_TYPES
 PARA_TYPES = vimban.PARA_TYPES
@@ -188,6 +190,98 @@ GNU Affero General Public License for more details.
 
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>."""
+
+
+# ============================================================================
+# REMOTE TICKET LOADING
+# ============================================================================
+# module-level remote state — set at startup if --remote is active
+_tui_remote_url: str | None = None
+_tui_remote_token: str | None = None
+
+
+def _remote_list_tickets(
+    directory: Path,
+    filters: dict[str, Any] | None = None,
+    exclude_types: list[str] | None = None,
+    include_archived: bool = False,
+) -> list:
+    """
+    Load tickets from a remote vimban_serve API.
+
+    Drop-in replacement for fallback_list_tickets() that fetches data
+    from the remote API instead of the local filesystem. Returns Ticket
+    objects by constructing them from JSON data.
+
+    Args:
+        directory: Ignored in remote mode (kept for API compat)
+        filters: Dict of filter keys (status, type, assignee, etc.)
+        exclude_types: Types to exclude from results
+        include_archived: Whether to include archived items
+
+    Returns:
+        List of Ticket objects
+    """
+    if not _tui_remote_url:
+        return []
+
+    params: dict[str, str] = {}
+    if filters:
+        if 'status' in filters:
+            params['status'] = filters['status']
+        if 'type' in filters:
+            params['type'] = filters['type']
+        if 'assignee' in filters:
+            params['assignee'] = filters['assignee']
+    if include_archived:
+        params['include_done'] = 'true'
+
+    try:
+        resp: dict = _remote_request(_tui_remote_url, "GET", "/api/tickets", _tui_remote_token, params=params)
+    except SystemExit:
+        return []
+
+    tickets: list = []
+    raw_list: list = resp.get("tickets", [])
+    for item in raw_list:
+        # skip excluded types
+        if exclude_types and item.get("type", "") in exclude_types:
+            continue
+        # construct a Ticket object from the JSON dict
+        try:
+            t: Ticket = Ticket(
+                id=item.get("id", ""),
+                title=item.get("title", ""),
+                ticket_type=item.get("type", "task"),
+                status=item.get("status", "backlog"),
+                priority=item.get("priority", "medium"),
+                assignee=item.get("assignee", ""),
+                reporter=item.get("reporter", ""),
+                tags=item.get("tags", []) if isinstance(item.get("tags"), list) else [],
+                created=datetime.fromisoformat(item["created"]) if item.get("created") else None,
+                updated=datetime.fromisoformat(item["updated"]) if item.get("updated") else None,
+                filepath=Path(item.get("filepath", "")) if item.get("filepath") else None,
+                project=item.get("project", ""),
+                effort=item.get("effort", 0) or 0,
+                progress=item.get("progress", 0) or 0,
+            )
+            # set optional fields that may not be in Ticket constructor
+            if hasattr(t, 'due_date') and item.get("due_date"):
+                try:
+                    t.due_date = date.fromisoformat(item["due_date"])
+                except (ValueError, TypeError):
+                    pass
+            if hasattr(t, 'end_date') and item.get("end_date"):
+                try:
+                    t.end_date = date.fromisoformat(item["end_date"])
+                except (ValueError, TypeError):
+                    pass
+            tickets.append(t)
+        except Exception:
+            # skip malformed entries
+            continue
+
+    return tickets
 
 
 # ============================================================================
@@ -2211,11 +2305,15 @@ class VimbanTUI:
         self,
         stdscr: Any,
         vimban_config: Config,
-        tui_config: TUIConfig
+        tui_config: TUIConfig,
+        remote_url: str | None = None,
+        remote_token: str | None = None,
     ):
         self.stdscr: Any = stdscr
         self.vimban_config: Config = vimban_config
         self.tui_config: TUIConfig = tui_config
+        self.remote_url: str | None = remote_url
+        self.remote_token: str | None = remote_token
 
         # Initialize managers
         self.state_manager: StateManager = StateManager(vimban_config, tui_config)
@@ -2256,6 +2354,28 @@ class VimbanTUI:
     def state(self) -> AppState:
         """Shortcut to access app state."""
         return self.state_manager.state
+
+    def _vimban_base_cmd(self) -> list[str]:
+        """
+        Build the base vimban command with remote flags if active.
+
+        Returns a list like ['vimban', '--directory', '...'] or
+        ['vimban', '--remote', 'http://...', '--api-token', '...']
+        when remote mode is enabled.
+
+        Returns:
+            Base command list to extend with subcommand args
+        """
+        cmd: list[str] = ['vimban']
+        if self.remote_url:
+            cmd.extend(['--remote', self.remote_url])
+            if self.remote_token:
+                cmd.extend(['--api-token', self.remote_token])
+            else:
+                cmd.append('--no-token')
+        else:
+            cmd.extend(['--directory', str(self.vimban_config.directory)])
+        return cmd
 
     def run(self) -> int:
         """
@@ -3581,6 +3701,21 @@ Examples:
         help='Skip pulling from remote on startup'
     )
 
+    # Remote API flags
+    parser.add_argument(
+        '--remote',
+        help='Connect to remote vimban_serve (URL or config:<name>)'
+    )
+    parser.add_argument(
+        '--api-token',
+        help='API token for remote server authentication'
+    )
+    parser.add_argument(
+        '--no-token',
+        action='store_true',
+        help='Skip sending auth token to remote server'
+    )
+
     return parser.parse_args()
 
 
@@ -3615,8 +3750,25 @@ def main(stdscr: Any, args: argparse.Namespace) -> int:
     if args.archived:
         tui_config.include_archived = True
 
+    # Resolve remote settings
+    remote_url: str | None = None
+    remote_token: str | None = None
+    if getattr(args, 'remote', None):
+        remote_url, remote_token = _resolve_remote(args.remote)
+        if getattr(args, 'api_token', None):
+            remote_token = args.api_token
+        if getattr(args, 'no_token', False):
+            remote_token = None
+
+        # set module-level remote state so _remote_list_tickets works
+        global _tui_remote_url, _tui_remote_token, fallback_list_tickets
+        _tui_remote_url = remote_url
+        _tui_remote_token = remote_token
+        # swap out the data loader for remote mode
+        fallback_list_tickets = _remote_list_tickets
+
     # Create and run TUI
-    tui: VimbanTUI = VimbanTUI(stdscr, vimban_config, tui_config)
+    tui: VimbanTUI = VimbanTUI(stdscr, vimban_config, tui_config, remote_url, remote_token)
     return tui.run()
 
 
@@ -3652,8 +3804,8 @@ if __name__ == "__main__":
         print(LICENSE_TEXT)
         sys_exit(0)
 
-    # Startup pull unless disabled
-    if not args.no_pull:
+    # Startup pull unless disabled (skip in remote mode — no local git)
+    if not args.no_pull and not getattr(args, 'remote', None):
         startup_pull(args.directory)
 
     try:

@@ -87,12 +87,20 @@ default_scope: "personal"
 distrobox: "dev"
 
 # ============================================================================
-# Web Server (vimban_serve / vimban --server)
+# Web Server (vimban_serve / vimban --serve)
 # ============================================================================
 
 # Port for the web UI server
 # Default: 5005
 server_port: 5005
+
+# Default remote server for --remote flag
+# Can be a URL or "config:<name>" (resolves from remote.yaml)
+# default_remote: ""
+
+# Default API token for remote connections
+# Overridden by --api-token flag
+# default_api_token: ""
 
 # ============================================================================
 # TUI Settings

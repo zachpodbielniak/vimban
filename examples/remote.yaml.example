@@ -1,0 +1,28 @@
+# vimban remote server configuration
+# Copy this file to ~/.config/vimban/remote.yaml and customize
+#
+# Named remotes are referenced with: vimban --remote config:<name>
+# For example: vimban --remote config:work
+#
+# See docs/configuration.md for full reference.
+
+# ============================================================================
+# Example: Work server on the LAN
+# ============================================================================
+work:
+  url: "http://192.168.1.10:5005"
+  api_token: "your-api-token-here"
+
+# ============================================================================
+# Example: Personal server over HTTPS
+# ============================================================================
+home:
+  url: "https://vimban.example.com:5005"
+  api_token: "another-token-here"
+
+# ============================================================================
+# Example: Local dev server (no auth)
+# ============================================================================
+local:
+  url: "http://127.0.0.1:5005"
+  # api_token omitted — use with --no-token
