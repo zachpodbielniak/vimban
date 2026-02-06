@@ -9298,6 +9298,8 @@ Environment Variables:
                            help='Run as MCP server (stdio transport)')
     mcp_group.add_argument('--mcp-http', action='store_true',
                            help='Run as MCP server (HTTP transport, port 5004)')
+    mcp_group.add_argument('--server', action='store_true',
+                           help='Start web UI server (default port 5005)')
 
     # Work/Personal scope (mutually exclusive)
     scope_group = parser.add_mutually_exclusive_group()
@@ -9667,6 +9669,19 @@ def main() -> int:
         return run_mcp_server(transport="stdio")
     elif getattr(args, 'mcp_http', False):
         return run_mcp_server(transport="http", host="127.0.0.1", port=5004)
+    elif getattr(args, 'server', False):
+        # launch the web UI server (vimban_serve)
+        script_dir: Path = Path(__file__).resolve().parent
+        serve_script: Path = script_dir / "vimban_serve"
+        if not serve_script.exists():
+            error("vimban_serve not found. Ensure it is installed alongside vimban.")
+        serve_cmd: list[str] = [str(serve_script)] + [
+            a for a in argv[1:] if a != "--server"
+        ]
+        env_copy: dict[str, str] = environ.copy()
+        env_copy["NO_DBOX_CHECK"] = "1"
+        result = subprocess.run(serve_cmd, env=env_copy)
+        return result.returncode
 
     # Get directory from args, env, or default
     directory = Path(

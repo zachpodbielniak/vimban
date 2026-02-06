@@ -223,6 +223,39 @@ vimban_recipe "Smash Burgers"
 vimban_mentor "Weekly 1:1 with Junior Dev" --date 2026-02-06
 ```
 
+## Web Server
+
+Launch a full web UI in the browser:
+
+```bash
+# Via vimban
+vimban --server
+
+# Or directly
+vimban_serve
+
+# With options
+vimban_serve --port 8080
+vimban_serve --bind 0.0.0.0 --port 5005
+```
+
+The web UI provides the same features as the TUI: kanban board, list view, dashboards, people view, ticket creation, status transitions, comments, and search.
+
+Default port is 5005. Override via `server_port` in config.yaml or `--port` flag.
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `c` | Create new ticket |
+| `r` | Refresh current view |
+| `s` | Git sync |
+| `1-4` | Switch views (Kanban, List, Dashboard, People) |
+| `/` | Focus search |
+| `Esc` | Close modals |
+
+Requires `quart` and `quart-cors` Python packages.
+
 ## MCP Server
 
 Vimban can run as an MCP (Model Context Protocol) server for AI assistant integration:

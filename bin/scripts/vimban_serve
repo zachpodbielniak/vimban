@@ -1,0 +1,2321 @@
+#!/usr/bin/python3
+
+# vimban - Markdown-native ticket/kanban management system
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+vimban_serve - Web UI for vimban ticket management
+
+A single-file async web server providing a full-featured web interface
+for vimban. Equivalent to the TUI but in the browser, with kanban board,
+list view, dashboards, search, and full CRUD operations.
+
+Usage:
+    vimban_serve [options]
+    vimban --server [options]
+
+Examples:
+    vimban_serve
+    vimban_serve --port 5005
+    vimban_serve --bind 0.0.0.0 --port 8080
+"""
+
+# ============================================================================
+# DISTROBOX CHECK (Before any other imports)
+# ============================================================================
+import os
+import subprocess
+import sys
+from pathlib import Path as _Path
+
+
+def _read_config_value(key: str, default: str = "") -> str:
+    """
+    Read a single top-level key from config.yaml using stdlib only.
+
+    Args:
+        key: The YAML key to look up
+        default: Fallback if key is not found
+
+    Returns:
+        The value as a string, or default
+    """
+    config_path: _Path = _Path.home() / ".config" / "vimban" / "config.yaml"
+    if not config_path.exists():
+        return default
+    try:
+        with open(config_path, "r") as f:
+            for line in f:
+                stripped: str = line.strip()
+                if stripped.startswith("#") or ":" not in stripped:
+                    continue
+                k, _, v = stripped.partition(":")
+                if k.strip() == key:
+                    val: str = v.strip().strip('"').strip("'")
+                    return val if val else default
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+ctr_id: str = os.environ.get("CONTAINER_ID", "")
+no_dbox_check: bool = os.environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+if not no_dbox_check:
+    _cfg_dbox: str = _read_config_value("distrobox", "")
+    if _cfg_dbox.lower() in ("", "false", "none", "disabled", "off"):
+        no_dbox_check = True
+
+_dbox_target: str = os.environ.get("VIMBAN_DISTROBOX", "") or _read_config_value("distrobox", "dev")
+
+if not no_dbox_check and (_dbox_target != ctr_id):
+    cmd: list[str] = ["distrobox", "enter", _dbox_target, "--", *sys.argv]
+    subprocess.run(cmd)
+    sys.exit(0)
+
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+import argparse
+import asyncio
+import json
+import re
+from datetime import datetime, date, timedelta
+from typing import Any, Optional
+
+try:
+    from quart import Quart, request, jsonify
+    from quart_cors import cors
+except ImportError:
+    print("Error: Quart and quart-cors are required for vimban_serve", file=sys.stderr)
+    print("Install with: pip install quart quart-cors", file=sys.stderr)
+    sys.exit(1)
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+VERSION: str = "0.1.0"
+DEFAULT_PORT: int = 5005
+DEFAULT_BIND: str = "127.0.0.1"
+
+STATUSES: list[str] = [
+    "backlog", "ready", "in_progress", "blocked",
+    "review", "delegated", "done", "cancelled"
+]
+
+TICKET_TYPES: list[str] = [
+    "epic", "story", "task", "sub-task", "research", "bug"
+]
+
+PARA_TYPES: list[str] = [
+    "area", "resource", "meeting", "journal", "recipe", "mentorship", "person"
+]
+
+ALL_TYPES: list[str] = TICKET_TYPES + PARA_TYPES
+
+PRIORITIES: list[str] = ["critical", "high", "medium", "low"]
+
+DASHBOARD_TYPES: list[str] = ["daily", "weekly", "sprint", "project", "team"]
+
+STATUS_COLORS: dict[str, str] = {
+    "backlog": "#6c7086",
+    "ready": "#89b4fa",
+    "in_progress": "#f9e2af",
+    "blocked": "#f38ba8",
+    "review": "#cba6f7",
+    "delegated": "#94e2d5",
+    "done": "#a6e3a1",
+    "cancelled": "#585b70",
+}
+
+PRIORITY_COLORS: dict[str, str] = {
+    "critical": "#f38ba8",
+    "high": "#fab387",
+    "medium": "#f9e2af",
+    "low": "#a6e3a1",
+}
+
+LICENSE_TEXT: str = """vimban_serve - Web UI for vimban ticket management
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>."""
+
+
+# ============================================================================
+# VIMBAN CLI INTERFACE
+# ============================================================================
+def _vimban_cmd(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
+    """
+    Run a vimban CLI command and capture output.
+
+    Args:
+        args: Command arguments (without 'vimban' prefix)
+        timeout: Command timeout in seconds
+
+    Returns:
+        Tuple of (return_code, stdout, stderr)
+    """
+    cmd: list[str] = ["vimban", "--no-color", "-q"] + args
+    env: dict[str, str] = os.environ.copy()
+    env["NO_DBOX_CHECK"] = "1"
+    try:
+        result: subprocess.CompletedProcess = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=env
+        )
+        return (result.returncode, result.stdout, result.stderr)
+    except subprocess.TimeoutExpired:
+        return (1, "", "Command timed out")
+    except FileNotFoundError:
+        return (1, "", "vimban not found in PATH")
+
+
+def _parse_yaml_output(stdout: str) -> list[dict[str, Any]]:
+    """
+    Parse YAML-format output from vimban list.
+
+    Args:
+        stdout: Raw stdout from vimban list -f yaml
+
+    Returns:
+        List of ticket dicts
+    """
+    try:
+        import yaml
+        data: Any = yaml.safe_load(stdout)
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
+
+
+def _parse_json_output(stdout: str) -> Any:
+    """
+    Parse JSON-format output from vimban commands.
+
+    Args:
+        stdout: Raw stdout from vimban -f json
+
+    Returns:
+        Parsed data structure
+    """
+    try:
+        return json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def list_tickets(
+    status: str = "",
+    ticket_type: str = "",
+    assignee: str = "",
+    priority: str = "",
+    project: str = "",
+    search: str = "",
+    work: bool = False,
+    personal: bool = False,
+    include_done: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    List tickets with optional filters.
+
+    Returns:
+        List of ticket dicts with frontmatter fields
+    """
+    args: list[str] = ["list", "-f", "json"]
+    if status:
+        args.extend(["-s", status])
+    if ticket_type:
+        args.extend(["-t", ticket_type])
+    if assignee:
+        args.extend(["--assignee", assignee])
+    if priority:
+        args.extend(["--priority", priority])
+    if project:
+        args.extend(["-P", project])
+    if work:
+        args.append("--work")
+    if personal:
+        args.append("--personal")
+    if include_done:
+        args.append("--archived")
+
+    rc, stdout, stderr = _vimban_cmd(args)
+    if rc != 0:
+        return []
+
+    data: Any = _parse_json_output(stdout)
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def get_ticket(ticket_id: str) -> Optional[dict[str, Any]]:
+    """
+    Get a single ticket by ID.
+
+    Args:
+        ticket_id: The ticket ID (e.g., PROJ-00042)
+
+    Returns:
+        Ticket dict or None
+    """
+    rc, stdout, stderr = _vimban_cmd(["show", ticket_id, "-f", "json"])
+    if rc != 0:
+        return None
+    return _parse_json_output(stdout)
+
+
+def create_ticket(
+    ticket_type: str,
+    title: str,
+    priority: str = "medium",
+    assignee: str = "",
+    reporter: str = "",
+    project: str = "",
+    tags: str = "",
+    due: str = "",
+    member_of: str = "",
+    work: bool = False,
+    personal: bool = False,
+) -> tuple[bool, str]:
+    """
+    Create a new ticket.
+
+    Returns:
+        Tuple of (success, message_or_id)
+    """
+    args: list[str] = ["create", ticket_type, title, "--no-edit", "-p", priority]
+    if assignee:
+        args.extend(["-a", assignee])
+    if reporter:
+        args.extend(["-r", reporter])
+    if project:
+        args.extend(["-P", project])
+    if tags:
+        args.extend(["-t", tags])
+    if due:
+        args.extend(["--due", due])
+    if member_of:
+        args.extend(["-m", member_of])
+    if work:
+        args.append("--work")
+    if personal:
+        args.append("--personal")
+
+    rc, stdout, stderr = _vimban_cmd(args)
+    if rc != 0:
+        return (False, stderr.strip() or "Failed to create ticket")
+
+    # extract ticket ID from output
+    match: Optional[re.Match] = re.search(r'([A-Z]+-\d+)', stdout)
+    if match:
+        return (True, match.group(1))
+    return (True, stdout.strip())
+
+
+def move_ticket(ticket_id: str, new_status: str) -> tuple[bool, str]:
+    """
+    Move a ticket to a new status.
+
+    Returns:
+        Tuple of (success, message)
+    """
+    rc, stdout, stderr = _vimban_cmd(["move", ticket_id, new_status])
+    if rc != 0:
+        return (False, stderr.strip() or "Failed to move ticket")
+    return (True, f"Moved {ticket_id} to {new_status}")
+
+
+def add_comment(ticket_id: str, text: str) -> tuple[bool, str]:
+    """
+    Add a comment to a ticket.
+
+    Returns:
+        Tuple of (success, message)
+    """
+    rc, stdout, stderr = _vimban_cmd(["comment", ticket_id, text])
+    if rc != 0:
+        return (False, stderr.strip() or "Failed to add comment")
+    return (True, "Comment added")
+
+
+def edit_ticket(ticket_id: str, fields: dict[str, str]) -> tuple[bool, str]:
+    """
+    Edit ticket fields.
+
+    Args:
+        ticket_id: Ticket ID
+        fields: Dict of field name to new value
+
+    Returns:
+        Tuple of (success, message)
+    """
+    args: list[str] = ["edit", ticket_id]
+    for field, value in fields.items():
+        if field == "priority":
+            args.extend(["--priority", value])
+        elif field == "assignee":
+            args.extend(["--assignee", value])
+        elif field == "progress":
+            args.extend(["--progress", value])
+        elif field == "tags":
+            args.extend(["--tags", value])
+        elif field == "due_date":
+            args.extend(["--due", value])
+
+    rc, stdout, stderr = _vimban_cmd(args)
+    if rc != 0:
+        return (False, stderr.strip() or "Failed to edit ticket")
+    return (True, "Ticket updated")
+
+
+def get_dashboard(dashboard_type: str = "daily") -> str:
+    """
+    Get dashboard output.
+
+    Returns:
+        Dashboard text content
+    """
+    rc, stdout, stderr = _vimban_cmd(["dashboard", dashboard_type])
+    if rc != 0:
+        return f"Error: {stderr}"
+    return stdout
+
+
+def get_kanban() -> str:
+    """
+    Get kanban board output.
+
+    Returns:
+        Kanban text content
+    """
+    rc, stdout, stderr = _vimban_cmd(["kanban"])
+    if rc != 0:
+        return f"Error: {stderr}"
+    return stdout
+
+
+def search_tickets(query: str) -> list[dict[str, Any]]:
+    """
+    Search tickets by keyword.
+
+    Returns:
+        List of matching ticket dicts
+    """
+    rc, stdout, stderr = _vimban_cmd(["search", query, "-f", "json"])
+    if rc != 0:
+        return []
+    data: Any = _parse_json_output(stdout)
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def list_people() -> list[dict[str, Any]]:
+    """
+    List people.
+
+    Returns:
+        List of people dicts
+    """
+    rc, stdout, stderr = _vimban_cmd(["people", "list", "-f", "json"])
+    if rc != 0:
+        return []
+    data: Any = _parse_json_output(stdout)
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def git_sync() -> tuple[bool, str]:
+    """
+    Run vimban commit (git sync).
+
+    Returns:
+        Tuple of (success, message)
+    """
+    rc, stdout, stderr = _vimban_cmd(["commit"], timeout=60)
+    if rc != 0:
+        return (False, stderr.strip() or "Sync failed")
+    return (True, stdout.strip() or "Synced successfully")
+
+
+# ============================================================================
+# QUART APP
+# ============================================================================
+app: Quart = Quart(__name__)
+app = cors(app, allow_origin="*")
+
+
+# ============================================================================
+# HTML TEMPLATE
+# ============================================================================
+HTML_TEMPLATE: str = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vimban</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* Catppuccin Mocha */
+            --bg-base: #1e1e2e;
+            --bg-mantle: #181825;
+            --bg-crust: #11111b;
+            --bg-surface0: #313244;
+            --bg-surface1: #45475a;
+            --bg-surface2: #585b70;
+            --bg-overlay0: #6c7086;
+            --text: #cdd6f4;
+            --text-sub: #bac2de;
+            --text-overlay: #a6adc8;
+            --text-muted: #6c7086;
+            --blue: #89b4fa;
+            --lavender: #b4befe;
+            --sapphire: #74c7ec;
+            --teal: #94e2d5;
+            --green: #a6e3a1;
+            --yellow: #f9e2af;
+            --peach: #fab387;
+            --maroon: #eba0ac;
+            --red: #f38ba8;
+            --mauve: #cba6f7;
+            --pink: #f5c2e7;
+            --flamingo: #f2cdcd;
+            --rosewater: #f5e0dc;
+            --shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+            --radius: 8px;
+            --radius-sm: 4px;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'JetBrains Mono', monospace;
+            background: var(--bg-crust);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        /* ============================================================ */
+        /* HEADER                                                       */
+        /* ============================================================ */
+        .header {
+            background: linear-gradient(135deg, var(--bg-mantle), var(--bg-base));
+            border-bottom: 1px solid var(--bg-surface0);
+            padding: 14px 24px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+
+        .header-content {
+            max-width: 1800px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .logo h1 {
+            font-size: 22px;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--green), var(--teal));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .logo .version {
+            font-size: 11px;
+            color: var(--text-muted);
+            padding: 2px 8px;
+            background: var(--bg-surface0);
+            border-radius: 10px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        /* ============================================================ */
+        /* NAVIGATION TABS                                              */
+        /* ============================================================ */
+        .nav-tabs {
+            display: flex;
+            gap: 2px;
+            background: var(--bg-mantle);
+            padding: 4px;
+            border-radius: var(--radius);
+        }
+
+        .nav-tab {
+            padding: 8px 16px;
+            background: transparent;
+            border: none;
+            border-radius: var(--radius-sm);
+            color: var(--text-muted);
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .nav-tab:hover {
+            color: var(--text);
+            background: var(--bg-surface0);
+        }
+
+        .nav-tab.active {
+            color: var(--bg-crust);
+            background: var(--green);
+            font-weight: 600;
+        }
+
+        /* ============================================================ */
+        /* STATS BAR                                                    */
+        /* ============================================================ */
+        .stats-bar {
+            display: flex;
+            gap: 12px;
+            padding: 12px 24px;
+            background: var(--bg-mantle);
+            border-bottom: 1px solid var(--bg-surface0);
+            flex-wrap: wrap;
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            background: var(--bg-base);
+            border-radius: var(--radius);
+            border: 1px solid var(--bg-surface0);
+            font-size: 12px;
+        }
+
+        .stat-value {
+            font-weight: 700;
+            color: var(--green);
+            font-size: 16px;
+        }
+
+        .stat-label { color: var(--text-muted); }
+
+        /* ============================================================ */
+        /* MAIN LAYOUT                                                  */
+        /* ============================================================ */
+        .main-container {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 20px 24px;
+        }
+
+        /* ============================================================ */
+        /* TOOLBAR                                                      */
+        /* ============================================================ */
+        .toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .search-box {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex: 1;
+            max-width: 400px;
+        }
+
+        .search-input {
+            flex: 1;
+            padding: 10px 14px;
+            background: var(--bg-base);
+            border: 1px solid var(--bg-surface0);
+            border-radius: var(--radius);
+            color: var(--text);
+            font-family: inherit;
+            font-size: 13px;
+            transition: all 0.2s ease;
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--green);
+            box-shadow: 0 0 0 3px rgba(166, 227, 161, 0.1);
+        }
+
+        .search-input::placeholder { color: var(--text-muted); }
+
+        .filters {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        select {
+            padding: 8px 12px;
+            background: var(--bg-base);
+            border: 1px solid var(--bg-surface0);
+            border-radius: var(--radius);
+            color: var(--text);
+            font-family: inherit;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        select:hover { border-color: var(--blue); }
+        select:focus { outline: none; border-color: var(--green); }
+
+        /* ============================================================ */
+        /* BUTTONS                                                      */
+        /* ============================================================ */
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: var(--radius);
+            cursor: pointer;
+            font-family: inherit;
+            font-weight: 600;
+            font-size: 13px;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--green), var(--teal));
+            color: var(--bg-crust);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px rgba(166, 227, 161, 0.3);
+        }
+
+        .btn-secondary {
+            background: var(--bg-surface0);
+            color: var(--text);
+            border: 1px solid var(--bg-surface1);
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-surface1);
+            border-color: var(--blue);
+        }
+
+        .btn-danger {
+            background: var(--red);
+            color: var(--bg-crust);
+        }
+
+        .btn-danger:hover { background: var(--maroon); }
+
+        .btn-small {
+            padding: 5px 10px;
+            font-size: 11px;
+        }
+
+        .btn-icon {
+            padding: 6px;
+            min-width: 32px;
+            justify-content: center;
+        }
+
+        /* ============================================================ */
+        /* BADGES                                                       */
+        /* ============================================================ */
+        .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .badge-backlog { background: rgba(108,112,134,0.2); color: var(--bg-overlay0); }
+        .badge-ready { background: rgba(137,180,250,0.2); color: var(--blue); }
+        .badge-in_progress { background: rgba(249,226,175,0.2); color: var(--yellow); }
+        .badge-blocked { background: rgba(243,139,168,0.2); color: var(--red); }
+        .badge-review { background: rgba(203,166,247,0.2); color: var(--mauve); }
+        .badge-delegated { background: rgba(148,226,213,0.2); color: var(--teal); }
+        .badge-done { background: rgba(166,227,161,0.2); color: var(--green); }
+        .badge-cancelled { background: rgba(88,91,112,0.2); color: var(--bg-surface2); }
+
+        .badge-critical { background: rgba(243,139,168,0.2); color: var(--red); }
+        .badge-high { background: rgba(250,179,135,0.2); color: var(--peach); }
+        .badge-medium { background: rgba(249,226,175,0.2); color: var(--yellow); }
+        .badge-low { background: rgba(166,227,161,0.2); color: var(--green); }
+
+        .tags { display: flex; gap: 4px; flex-wrap: wrap; }
+
+        .tag {
+            padding: 2px 8px;
+            background: var(--bg-surface0);
+            border-radius: var(--radius-sm);
+            font-size: 11px;
+            color: var(--text-overlay);
+        }
+
+        /* ============================================================ */
+        /* TABLE                                                        */
+        /* ============================================================ */
+        .table-container {
+            background: var(--bg-base);
+            border-radius: var(--radius);
+            border: 1px solid var(--bg-surface0);
+            overflow: hidden;
+            box-shadow: var(--shadow);
+        }
+
+        .table-scroll { overflow-x: auto; }
+
+        table { width: 100%; border-collapse: collapse; }
+
+        th, td {
+            padding: 12px 14px;
+            text-align: left;
+            border-bottom: 1px solid var(--bg-surface0);
+        }
+
+        th {
+            background: var(--bg-mantle);
+            font-weight: 600;
+            color: var(--text-muted);
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            position: sticky;
+            top: 0;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        th:hover { color: var(--green); }
+        th.sorted-asc::after { content: ' \\25B2'; color: var(--green); }
+        th.sorted-desc::after { content: ' \\25BC'; color: var(--green); }
+
+        tr { transition: background 0.15s ease; }
+        tr:hover { background: var(--bg-mantle); }
+        tr.clickable { cursor: pointer; }
+
+        td { font-size: 13px; }
+
+        .id-cell {
+            font-weight: 600;
+            color: var(--blue);
+            white-space: nowrap;
+        }
+
+        .title-cell {
+            max-width: 350px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .date-cell {
+            color: var(--text-muted);
+            white-space: nowrap;
+            font-size: 12px;
+        }
+
+        .progress-bar-bg {
+            width: 80px;
+            height: 6px;
+            background: var(--bg-surface0);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--green);
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+
+        /* ============================================================ */
+        /* KANBAN BOARD                                                 */
+        /* ============================================================ */
+        .kanban-board {
+            display: flex;
+            gap: 12px;
+            overflow-x: auto;
+            padding-bottom: 12px;
+            min-height: 500px;
+        }
+
+        .kanban-column {
+            flex: 0 0 280px;
+            background: var(--bg-base);
+            border-radius: var(--radius);
+            border: 1px solid var(--bg-surface0);
+            display: flex;
+            flex-direction: column;
+            max-height: calc(100vh - 250px);
+        }
+
+        .kanban-column-header {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--bg-surface0);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--bg-mantle);
+            border-radius: var(--radius) var(--radius) 0 0;
+        }
+
+        .kanban-column-title {
+            font-weight: 600;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .kanban-column-count {
+            background: var(--bg-surface0);
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+
+        .kanban-column-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .kanban-card {
+            background: var(--bg-mantle);
+            border: 1px solid var(--bg-surface0);
+            border-radius: var(--radius-sm);
+            padding: 10px 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .kanban-card:hover {
+            border-color: var(--blue);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+
+        .kanban-card-id {
+            font-size: 11px;
+            color: var(--blue);
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .kanban-card-title {
+            font-size: 13px;
+            margin-bottom: 6px;
+            line-height: 1.4;
+        }
+
+        .kanban-card-meta {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        /* ============================================================ */
+        /* MODAL                                                        */
+        /* ============================================================ */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.75);
+            z-index: 1000;
+            justify-content: center;
+            align-items: flex-start;
+            padding: 40px 20px;
+            overflow-y: auto;
+            backdrop-filter: blur(4px);
+        }
+
+        .modal-overlay.active { display: flex; }
+
+        .modal {
+            background: var(--bg-base);
+            border: 1px solid var(--bg-surface0);
+            border-radius: var(--radius);
+            width: 100%;
+            max-width: 700px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            animation: modalSlide 0.2s ease;
+        }
+
+        @keyframes modalSlide {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--bg-surface0);
+        }
+
+        .modal-header h2 {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--green);
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 22px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: var(--radius-sm);
+            transition: all 0.2s;
+        }
+
+        .modal-close:hover {
+            color: var(--red);
+            background: var(--bg-surface0);
+        }
+
+        .modal-body { padding: 20px; }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            padding: 16px 20px;
+            border-top: 1px solid var(--bg-surface0);
+        }
+
+        /* ============================================================ */
+        /* FORM                                                         */
+        /* ============================================================ */
+        .form-group {
+            margin-bottom: 14px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .form-group input,
+        .form-group textarea,
+        .form-group select {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-mantle);
+            border: 1px solid var(--bg-surface0);
+            border-radius: var(--radius-sm);
+            color: var(--text);
+            font-family: inherit;
+            font-size: 13px;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus,
+        .form-group textarea:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: var(--green);
+        }
+
+        .form-group textarea {
+            min-height: 80px;
+            resize: vertical;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        /* ============================================================ */
+        /* DETAIL VIEW                                                  */
+        /* ============================================================ */
+        .detail-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 16px;
+        }
+
+        .detail-id {
+            font-size: 14px;
+            color: var(--blue);
+            font-weight: 600;
+        }
+
+        .detail-title {
+            font-size: 20px;
+            font-weight: 700;
+            margin: 8px 0;
+        }
+
+        .detail-meta {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+            padding: 14px;
+            background: var(--bg-mantle);
+            border-radius: var(--radius);
+            border: 1px solid var(--bg-surface0);
+        }
+
+        .detail-field label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .detail-field .value {
+            font-size: 13px;
+            margin-top: 2px;
+        }
+
+        .detail-body {
+            padding: 14px;
+            background: var(--bg-mantle);
+            border-radius: var(--radius);
+            border: 1px solid var(--bg-surface0);
+            margin-bottom: 16px;
+            white-space: pre-wrap;
+            font-size: 13px;
+            line-height: 1.7;
+        }
+
+        .comment-list {
+            margin-top: 16px;
+        }
+
+        .comment {
+            padding: 12px;
+            background: var(--bg-mantle);
+            border-radius: var(--radius);
+            border: 1px solid var(--bg-surface0);
+            margin-bottom: 8px;
+        }
+
+        .comment-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .comment-author { color: var(--blue); font-weight: 600; }
+
+        .comment-body { font-size: 13px; }
+
+        .comment-form {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .comment-form input {
+            flex: 1;
+            padding: 8px 12px;
+            background: var(--bg-mantle);
+            border: 1px solid var(--bg-surface0);
+            border-radius: var(--radius-sm);
+            color: var(--text);
+            font-family: inherit;
+            font-size: 13px;
+        }
+
+        .comment-form input:focus {
+            outline: none;
+            border-color: var(--green);
+        }
+
+        /* ============================================================ */
+        /* DASHBOARD                                                    */
+        /* ============================================================ */
+        .dashboard-content {
+            background: var(--bg-base);
+            border-radius: var(--radius);
+            border: 1px solid var(--bg-surface0);
+            padding: 20px;
+            white-space: pre-wrap;
+            font-size: 13px;
+            line-height: 1.6;
+            max-height: calc(100vh - 300px);
+            overflow-y: auto;
+        }
+
+        .dashboard-tabs {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 16px;
+        }
+
+        /* ============================================================ */
+        /* PEOPLE VIEW                                                  */
+        /* ============================================================ */
+        .people-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+        }
+
+        .person-card {
+            background: var(--bg-base);
+            border: 1px solid var(--bg-surface0);
+            border-radius: var(--radius);
+            padding: 16px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .person-card:hover {
+            border-color: var(--blue);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+        }
+
+        .person-name {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 4px;
+        }
+
+        .person-role {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        .person-team {
+            font-size: 11px;
+            padding: 2px 8px;
+            background: var(--bg-surface0);
+            border-radius: var(--radius-sm);
+            color: var(--blue);
+            display: inline-block;
+        }
+
+        /* ============================================================ */
+        /* EMPTY STATE                                                  */
+        /* ============================================================ */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-muted);
+        }
+
+        .empty-state-icon { font-size: 48px; margin-bottom: 12px; }
+        .empty-state h3 { font-size: 18px; margin-bottom: 6px; color: var(--text-overlay); }
+        .empty-state p { font-size: 13px; }
+
+        /* ============================================================ */
+        /* TOAST                                                        */
+        /* ============================================================ */
+        .toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .toast {
+            padding: 12px 20px;
+            border-radius: var(--radius);
+            font-size: 13px;
+            font-weight: 500;
+            animation: toastIn 0.3s ease;
+            max-width: 400px;
+        }
+
+        .toast-success {
+            background: var(--green);
+            color: var(--bg-crust);
+        }
+
+        .toast-error {
+            background: var(--red);
+            color: var(--bg-crust);
+        }
+
+        @keyframes toastIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ============================================================ */
+        /* SCROLLBAR                                                    */
+        /* ============================================================ */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg-crust); }
+        ::-webkit-scrollbar-thumb { background: var(--bg-surface1); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--bg-surface2); }
+
+        /* ============================================================ */
+        /* RESPONSIVE                                                   */
+        /* ============================================================ */
+        @media (max-width: 768px) {
+            .header-content { flex-direction: column; align-items: flex-start; }
+            .toolbar { flex-direction: column; }
+            .search-box { max-width: 100%; }
+            .form-row { grid-template-columns: 1fr; }
+            .kanban-column { flex: 0 0 260px; }
+        }
+
+        /* ============================================================ */
+        /* VIEW PANELS (show/hide)                                      */
+        /* ============================================================ */
+        .view-panel { display: none; }
+        .view-panel.active { display: block; }
+    </style>
+</head>
+<body>
+    <!-- HEADER -->
+    <div class="header">
+        <div class="header-content">
+            <div class="logo">
+                <h1>vimban</h1>
+                <span class="version">v""" + VERSION + """</span>
+            </div>
+            <nav class="nav-tabs">
+                <button class="nav-tab active" onclick="switchView('kanban')">Kanban</button>
+                <button class="nav-tab" onclick="switchView('list')">List</button>
+                <button class="nav-tab" onclick="switchView('dashboard')">Dashboard</button>
+                <button class="nav-tab" onclick="switchView('people')">People</button>
+            </nav>
+            <div class="header-actions">
+                <button class="btn btn-secondary btn-small" onclick="gitSync()">Sync</button>
+                <button class="btn btn-primary btn-small" onclick="openCreateModal()">+ New</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- STATS BAR -->
+    <div class="stats-bar" id="statsBar"></div>
+
+    <!-- MAIN CONTENT -->
+    <div class="main-container">
+
+        <!-- KANBAN VIEW -->
+        <div class="view-panel active" id="view-kanban">
+            <div class="toolbar">
+                <div class="search-box">
+                    <input type="text" class="search-input" id="kanbanSearch"
+                           placeholder="Search tickets..." onkeyup="filterKanban()">
+                </div>
+                <div class="filters">
+                    <select id="kanbanPriority" onchange="loadKanban()">
+                        <option value="">All priorities</option>
+                        <option value="critical">Critical</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                    </select>
+                    <select id="kanbanType" onchange="loadKanban()">
+                        <option value="">All types</option>
+                        <option value="task">Task</option>
+                        <option value="bug">Bug</option>
+                        <option value="story">Story</option>
+                        <option value="epic">Epic</option>
+                        <option value="research">Research</option>
+                        <option value="sub-task">Sub-task</option>
+                    </select>
+                    <select id="kanbanScope" onchange="loadKanban()">
+                        <option value="">All scopes</option>
+                        <option value="work">Work</option>
+                        <option value="personal">Personal</option>
+                    </select>
+                </div>
+            </div>
+            <div class="kanban-board" id="kanbanBoard"></div>
+        </div>
+
+        <!-- LIST VIEW -->
+        <div class="view-panel" id="view-list">
+            <div class="toolbar">
+                <div class="search-box">
+                    <input type="text" class="search-input" id="listSearch"
+                           placeholder="Search tickets..." onkeyup="filterList()">
+                </div>
+                <div class="filters">
+                    <select id="listStatus" onchange="loadList()">
+                        <option value="">All statuses</option>
+                        <option value="backlog">Backlog</option>
+                        <option value="ready">Ready</option>
+                        <option value="in_progress">In Progress</option>
+                        <option value="blocked">Blocked</option>
+                        <option value="review">Review</option>
+                        <option value="delegated">Delegated</option>
+                        <option value="done">Done</option>
+                        <option value="cancelled">Cancelled</option>
+                    </select>
+                    <select id="listPriority" onchange="loadList()">
+                        <option value="">All priorities</option>
+                        <option value="critical">Critical</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                    </select>
+                    <select id="listType" onchange="loadList()">
+                        <option value="">All types</option>
+                        <option value="task">Task</option>
+                        <option value="bug">Bug</option>
+                        <option value="story">Story</option>
+                        <option value="epic">Epic</option>
+                        <option value="research">Research</option>
+                        <option value="sub-task">Sub-task</option>
+                    </select>
+                    <select id="listScope" onchange="loadList()">
+                        <option value="">All scopes</option>
+                        <option value="work">Work</option>
+                        <option value="personal">Personal</option>
+                    </select>
+                </div>
+            </div>
+            <div class="table-container">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th onclick="sortList('id')">ID</th>
+                                <th onclick="sortList('type')">Type</th>
+                                <th onclick="sortList('status')">Status</th>
+                                <th onclick="sortList('priority')">Priority</th>
+                                <th onclick="sortList('assignee')">Assignee</th>
+                                <th onclick="sortList('title')">Title</th>
+                                <th onclick="sortList('progress')">Progress</th>
+                                <th onclick="sortList('due_date')">Due</th>
+                            </tr>
+                        </thead>
+                        <tbody id="listBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- DASHBOARD VIEW -->
+        <div class="view-panel" id="view-dashboard">
+            <div class="dashboard-tabs">
+                <button class="btn btn-secondary btn-small active" onclick="loadDashboard('daily', this)">Daily</button>
+                <button class="btn btn-secondary btn-small" onclick="loadDashboard('weekly', this)">Weekly</button>
+                <button class="btn btn-secondary btn-small" onclick="loadDashboard('sprint', this)">Sprint</button>
+                <button class="btn btn-secondary btn-small" onclick="loadDashboard('project', this)">Project</button>
+                <button class="btn btn-secondary btn-small" onclick="loadDashboard('team', this)">Team</button>
+            </div>
+            <div class="dashboard-content" id="dashboardContent">Loading...</div>
+        </div>
+
+        <!-- PEOPLE VIEW -->
+        <div class="view-panel" id="view-people">
+            <div class="toolbar">
+                <div class="search-box">
+                    <input type="text" class="search-input" id="peopleSearch"
+                           placeholder="Search people..." onkeyup="filterPeople()">
+                </div>
+            </div>
+            <div class="people-grid" id="peopleGrid"></div>
+        </div>
+    </div>
+
+    <!-- CREATE MODAL -->
+    <div class="modal-overlay" id="createModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>Create Ticket</h2>
+                <button class="modal-close" onclick="closeModal('createModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Type</label>
+                        <select id="createType">
+                            <option value="task">Task</option>
+                            <option value="bug">Bug</option>
+                            <option value="story">Story</option>
+                            <option value="epic">Epic</option>
+                            <option value="sub-task">Sub-task</option>
+                            <option value="research">Research</option>
+                            <option value="meeting">Meeting</option>
+                            <option value="journal">Journal</option>
+                            <option value="recipe">Recipe</option>
+                            <option value="mentorship">Mentorship</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Priority</label>
+                        <select id="createPriority">
+                            <option value="medium">Medium</option>
+                            <option value="low">Low</option>
+                            <option value="high">High</option>
+                            <option value="critical">Critical</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Title</label>
+                    <input type="text" id="createTitle" placeholder="Ticket title...">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Assignee</label>
+                        <input type="text" id="createAssignee" placeholder="e.g. john_doe">
+                    </div>
+                    <div class="form-group">
+                        <label>Reporter</label>
+                        <input type="text" id="createReporter" placeholder="e.g. jane_doe">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Project</label>
+                        <input type="text" id="createProject" placeholder="e.g. myapp">
+                    </div>
+                    <div class="form-group">
+                        <label>Due Date</label>
+                        <input type="text" id="createDue" placeholder="e.g. +7d, 2026-03-01">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Tags</label>
+                        <input type="text" id="createTags" placeholder="comma-separated">
+                    </div>
+                    <div class="form-group">
+                        <label>Member Of</label>
+                        <input type="text" id="createMemberOf" placeholder="e.g. PROJ-00001">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Scope</label>
+                        <select id="createScope">
+                            <option value="">Default</option>
+                            <option value="personal">Personal</option>
+                            <option value="work">Work</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('createModal')">Cancel</button>
+                <button class="btn btn-primary" onclick="submitCreate()">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- DETAIL MODAL -->
+    <div class="modal-overlay" id="detailModal">
+        <div class="modal" style="max-width:800px;">
+            <div class="modal-header">
+                <h2 id="detailTitle">Ticket Detail</h2>
+                <button class="modal-close" onclick="closeModal('detailModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="detailBody">Loading...</div>
+        </div>
+    </div>
+
+    <!-- TOAST CONTAINER -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        /* ============================================================ */
+        /* STATE                                                        */
+        /* ============================================================ */
+        let currentView = 'kanban';
+        let allTickets = [];
+        let listSortField = 'id';
+        let listSortAsc = true;
+
+        /* ============================================================ */
+        /* UTILITIES                                                    */
+        /* ============================================================ */
+        function toast(msg, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            const el = document.createElement('div');
+            el.className = `toast toast-${type}`;
+            el.textContent = msg;
+            container.appendChild(el);
+            setTimeout(() => el.remove(), 4000);
+        }
+
+        async function api(url, opts = {}) {
+            try {
+                const resp = await fetch(url, {
+                    headers: { 'Content-Type': 'application/json' },
+                    ...opts
+                });
+                return await resp.json();
+            } catch (e) {
+                toast('Network error: ' + e.message, 'error');
+                return null;
+            }
+        }
+
+        function badgeHtml(value, prefix) {
+            if (!value) return '';
+            const cls = prefix + '-' + value.replace(/ /g, '_');
+            return `<span class="badge ${cls}">${value.replace(/_/g, ' ')}</span>`;
+        }
+
+        function tagsHtml(tags) {
+            if (!tags || !tags.length) return '';
+            const arr = Array.isArray(tags) ? tags : String(tags).split(',');
+            return '<div class="tags">' +
+                arr.map(t => `<span class="tag">${t.trim()}</span>`).join('') +
+                '</div>';
+        }
+
+        function progressHtml(val) {
+            const v = parseInt(val) || 0;
+            return `<div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${v}%"></div></div>`;
+        }
+
+        function truncate(s, n) {
+            if (!s) return '';
+            return s.length > n ? s.substring(0, n) + '...' : s;
+        }
+
+        /* ============================================================ */
+        /* VIEW SWITCHING                                               */
+        /* ============================================================ */
+        function switchView(view) {
+            currentView = view;
+            document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById('view-' + view).classList.add('active');
+
+            if (view === 'kanban') loadKanban();
+            else if (view === 'list') loadList();
+            else if (view === 'dashboard') loadDashboard('daily');
+            else if (view === 'people') loadPeople();
+        }
+
+        /* ============================================================ */
+        /* STATS                                                        */
+        /* ============================================================ */
+        async function loadStats() {
+            const data = await api('/api/tickets?include_done=false');
+            if (!data) return;
+            const tickets = data.tickets || [];
+            allTickets = tickets;
+
+            const counts = {};
+            tickets.forEach(t => {
+                const s = t.status || 'unknown';
+                counts[s] = (counts[s] || 0) + 1;
+            });
+
+            const bar = document.getElementById('statsBar');
+            bar.innerHTML = `
+                <div class="stat-item"><span class="stat-value">${tickets.length}</span><span class="stat-label">Total</span></div>
+                <div class="stat-item"><span class="stat-value">${counts.in_progress || 0}</span><span class="stat-label">In Progress</span></div>
+                <div class="stat-item"><span class="stat-value">${counts.ready || 0}</span><span class="stat-label">Ready</span></div>
+                <div class="stat-item"><span class="stat-value">${counts.blocked || 0}</span><span class="stat-label">Blocked</span></div>
+                <div class="stat-item"><span class="stat-value">${counts.review || 0}</span><span class="stat-label">Review</span></div>
+                <div class="stat-item"><span class="stat-value">${counts.backlog || 0}</span><span class="stat-label">Backlog</span></div>
+            `;
+        }
+
+        /* ============================================================ */
+        /* KANBAN VIEW                                                  */
+        /* ============================================================ */
+        async function loadKanban() {
+            const priority = document.getElementById('kanbanPriority').value;
+            const type = document.getElementById('kanbanType').value;
+            const scope = document.getElementById('kanbanScope').value;
+
+            let url = '/api/tickets?include_done=false';
+            if (priority) url += '&priority=' + priority;
+            if (type) url += '&type=' + type;
+            if (scope) url += '&scope=' + scope;
+
+            const data = await api(url);
+            if (!data) return;
+            const tickets = data.tickets || [];
+
+            const columns = ['backlog', 'ready', 'in_progress', 'blocked', 'review', 'delegated'];
+            const board = document.getElementById('kanbanBoard');
+
+            board.innerHTML = columns.map(status => {
+                const colTickets = tickets.filter(t => t.status === status);
+                const colorVar = {
+                    backlog: 'var(--bg-overlay0)',
+                    ready: 'var(--blue)',
+                    in_progress: 'var(--yellow)',
+                    blocked: 'var(--red)',
+                    review: 'var(--mauve)',
+                    delegated: 'var(--teal)'
+                }[status] || 'var(--text-muted)';
+
+                const cards = colTickets.map(t => `
+                    <div class="kanban-card" onclick="openDetail('${t.id}')">
+                        <div class="kanban-card-id">${t.id}</div>
+                        <div class="kanban-card-title">${truncate(t.title, 60)}</div>
+                        <div class="kanban-card-meta">
+                            ${badgeHtml(t.priority, 'badge')}
+                            ${t.assignee ? '<span class="tag">' + t.assignee + '</span>' : ''}
+                            ${t.type ? '<span class="tag">' + t.type + '</span>' : ''}
+                        </div>
+                    </div>
+                `).join('');
+
+                return `
+                    <div class="kanban-column">
+                        <div class="kanban-column-header">
+                            <span class="kanban-column-title" style="color:${colorVar}">${status.replace(/_/g, ' ')}</span>
+                            <span class="kanban-column-count">${colTickets.length}</span>
+                        </div>
+                        <div class="kanban-column-body">${cards || '<div class="empty-state"><p>No tickets</p></div>'}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function filterKanban() {
+            const q = document.getElementById('kanbanSearch').value.toLowerCase();
+            document.querySelectorAll('.kanban-card').forEach(card => {
+                const text = card.textContent.toLowerCase();
+                card.style.display = text.includes(q) ? '' : 'none';
+            });
+        }
+
+        /* ============================================================ */
+        /* LIST VIEW                                                    */
+        /* ============================================================ */
+        let listTickets = [];
+
+        async function loadList() {
+            const status = document.getElementById('listStatus').value;
+            const priority = document.getElementById('listPriority').value;
+            const type = document.getElementById('listType').value;
+            const scope = document.getElementById('listScope').value;
+
+            let url = '/api/tickets?';
+            if (status) url += 'status=' + status + '&';
+            if (priority) url += 'priority=' + priority + '&';
+            if (type) url += 'type=' + type + '&';
+            if (scope) url += 'scope=' + scope + '&';
+            if (status === 'done' || status === 'cancelled') url += 'include_done=true&';
+
+            const data = await api(url);
+            if (!data) return;
+            listTickets = data.tickets || [];
+            renderList();
+        }
+
+        function sortList(field) {
+            if (listSortField === field) {
+                listSortAsc = !listSortAsc;
+            } else {
+                listSortField = field;
+                listSortAsc = true;
+            }
+            renderList();
+        }
+
+        function renderList() {
+            const sorted = [...listTickets].sort((a, b) => {
+                const va = (a[listSortField] || '').toString().toLowerCase();
+                const vb = (b[listSortField] || '').toString().toLowerCase();
+                if (va < vb) return listSortAsc ? -1 : 1;
+                if (va > vb) return listSortAsc ? 1 : -1;
+                return 0;
+            });
+
+            const tbody = document.getElementById('listBody');
+            tbody.innerHTML = sorted.map(t => `
+                <tr class="clickable" onclick="openDetail('${t.id}')">
+                    <td class="id-cell">${t.id}</td>
+                    <td><span class="tag">${t.type || ''}</span></td>
+                    <td>${badgeHtml(t.status, 'badge')}</td>
+                    <td>${badgeHtml(t.priority, 'badge')}</td>
+                    <td>${t.assignee || ''}</td>
+                    <td class="title-cell">${truncate(t.title, 50)}</td>
+                    <td>${progressHtml(t.progress)}</td>
+                    <td class="date-cell">${t.due_date || ''}</td>
+                </tr>
+            `).join('');
+        }
+
+        function filterList() {
+            const q = document.getElementById('listSearch').value.toLowerCase();
+            document.querySelectorAll('#listBody tr').forEach(row => {
+                row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+            });
+        }
+
+        /* ============================================================ */
+        /* DASHBOARD VIEW                                               */
+        /* ============================================================ */
+        async function loadDashboard(type, btn) {
+            if (btn) {
+                document.querySelectorAll('.dashboard-tabs .btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+            }
+            const el = document.getElementById('dashboardContent');
+            el.textContent = 'Loading...';
+            const data = await api('/api/dashboard/' + type);
+            if (data) {
+                el.textContent = data.content || 'No data';
+            }
+        }
+
+        /* ============================================================ */
+        /* PEOPLE VIEW                                                  */
+        /* ============================================================ */
+        async function loadPeople() {
+            const data = await api('/api/people');
+            if (!data) return;
+            const people = data.people || [];
+            const grid = document.getElementById('peopleGrid');
+
+            if (!people.length) {
+                grid.innerHTML = '<div class="empty-state"><div class="empty-state-icon">👥</div><h3>No People</h3><p>No people records found</p></div>';
+                return;
+            }
+
+            grid.innerHTML = people.map(p => `
+                <div class="person-card" onclick="openPersonDetail('${p.id || p.name}')">
+                    <div class="person-name">${p.name || p.title || 'Unknown'}</div>
+                    <div class="person-role">${p.role || ''}</div>
+                    ${p.team ? '<span class="person-team">' + p.team + '</span>' : ''}
+                    ${p.email ? '<div style="font-size:12px;color:var(--text-muted);margin-top:6px">' + p.email + '</div>' : ''}
+                </div>
+            `).join('');
+        }
+
+        function filterPeople() {
+            const q = document.getElementById('peopleSearch').value.toLowerCase();
+            document.querySelectorAll('.person-card').forEach(card => {
+                card.style.display = card.textContent.toLowerCase().includes(q) ? '' : 'none';
+            });
+        }
+
+        async function openPersonDetail(id) {
+            /* re-use the detail modal for person info */
+            const data = await api('/api/ticket/' + encodeURIComponent(id));
+            if (!data || !data.ticket) { toast('Person not found', 'error'); return; }
+            showDetailModal(data.ticket);
+        }
+
+        /* ============================================================ */
+        /* TICKET DETAIL                                                */
+        /* ============================================================ */
+        async function openDetail(id) {
+            document.getElementById('detailModal').classList.add('active');
+            document.getElementById('detailBody').innerHTML = 'Loading...';
+            document.getElementById('detailTitle').textContent = id;
+
+            const data = await api('/api/ticket/' + encodeURIComponent(id));
+            if (!data || !data.ticket) {
+                document.getElementById('detailBody').innerHTML = '<p>Ticket not found</p>';
+                return;
+            }
+            showDetailModal(data.ticket);
+        }
+
+        function showDetailModal(t) {
+            document.getElementById('detailModal').classList.add('active');
+            document.getElementById('detailTitle').textContent = t.id || t.title || 'Detail';
+
+            const fields = [
+                ['Type', t.type],
+                ['Status', t.status],
+                ['Priority', t.priority],
+                ['Assignee', t.assignee],
+                ['Reporter', t.reporter],
+                ['Project', t.project],
+                ['Progress', t.progress != null ? t.progress + '%' : ''],
+                ['Due Date', t.due_date],
+                ['Created', t.created],
+                ['Updated', t.updated],
+                ['Member Of', t.member_of],
+                ['Tags', Array.isArray(t.tags) ? t.tags.join(', ') : (t.tags || '')],
+            ].filter(f => f[1]);
+
+            const metaHtml = fields.map(f => `
+                <div class="detail-field">
+                    <label>${f[0]}</label>
+                    <div class="value">${f[0] === 'Status' ? badgeHtml(f[1], 'badge') : (f[0] === 'Priority' ? badgeHtml(f[1], 'badge') : f[1])}</div>
+                </div>
+            `).join('');
+
+            const body = t.body || t.description || '';
+
+            /* parse comments from body */
+            let commentsHtml = '';
+            if (t.comments && t.comments.length) {
+                commentsHtml = '<div class="comment-list"><h3 style="margin-bottom:8px;font-size:14px;color:var(--text-overlay)">Comments</h3>' +
+                    t.comments.map(c => `
+                        <div class="comment">
+                            <div class="comment-header">
+                                <span class="comment-author">${c.author || 'unknown'}</span>
+                                <span>${c.date || ''}</span>
+                            </div>
+                            <div class="comment-body">${c.text || c.body || ''}</div>
+                        </div>
+                    `).join('') + '</div>';
+            }
+
+            document.getElementById('detailBody').innerHTML = `
+                <div class="detail-meta">${metaHtml}</div>
+                ${body ? '<div class="detail-body">' + body + '</div>' : ''}
+                ${commentsHtml}
+                <div class="comment-form">
+                    <input type="text" id="commentInput" placeholder="Add a comment...">
+                    <button class="btn btn-primary btn-small" onclick="submitComment('${t.id}')">Send</button>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap;">
+                    <select id="moveStatus" style="flex:1">
+                        <option value="">Move to...</option>
+                        ${['backlog','ready','in_progress','blocked','review','delegated','done','cancelled']
+                            .filter(s => s !== t.status)
+                            .map(s => '<option value="' + s + '">' + s.replace(/_/g,' ') + '</option>')
+                            .join('')}
+                    </select>
+                    <button class="btn btn-secondary btn-small" onclick="moveTicket('${t.id}')">Move</button>
+                    <select id="editPriority" style="flex:1">
+                        <option value="">Set priority...</option>
+                        ${['critical','high','medium','low']
+                            .filter(p => p !== t.priority)
+                            .map(p => '<option value="' + p + '">' + p + '</option>')
+                            .join('')}
+                    </select>
+                    <button class="btn btn-secondary btn-small" onclick="editPriority('${t.id}')">Set</button>
+                </div>
+            `;
+        }
+
+        async function submitComment(id) {
+            const text = document.getElementById('commentInput').value.trim();
+            if (!text) return;
+            const data = await api('/api/ticket/' + id + '/comment', {
+                method: 'POST',
+                body: JSON.stringify({ text })
+            });
+            if (data && data.success) {
+                toast('Comment added');
+                document.getElementById('commentInput').value = '';
+                openDetail(id);
+            } else {
+                toast(data?.message || 'Failed', 'error');
+            }
+        }
+
+        async function moveTicket(id) {
+            const status = document.getElementById('moveStatus').value;
+            if (!status) return;
+            const data = await api('/api/ticket/' + id + '/move', {
+                method: 'POST',
+                body: JSON.stringify({ status })
+            });
+            if (data && data.success) {
+                toast(`Moved ${id} to ${status}`);
+                closeModal('detailModal');
+                refreshCurrentView();
+            } else {
+                toast(data?.message || 'Failed to move', 'error');
+            }
+        }
+
+        async function editPriority(id) {
+            const priority = document.getElementById('editPriority').value;
+            if (!priority) return;
+            const data = await api('/api/ticket/' + id + '/edit', {
+                method: 'POST',
+                body: JSON.stringify({ priority })
+            });
+            if (data && data.success) {
+                toast('Priority updated');
+                openDetail(id);
+            } else {
+                toast(data?.message || 'Failed', 'error');
+            }
+        }
+
+        /* ============================================================ */
+        /* CREATE                                                       */
+        /* ============================================================ */
+        function openCreateModal() {
+            document.getElementById('createModal').classList.add('active');
+            document.getElementById('createTitle').focus();
+        }
+
+        async function submitCreate() {
+            const title = document.getElementById('createTitle').value.trim();
+            if (!title) { toast('Title is required', 'error'); return; }
+
+            const payload = {
+                type: document.getElementById('createType').value,
+                title,
+                priority: document.getElementById('createPriority').value,
+                assignee: document.getElementById('createAssignee').value.trim(),
+                reporter: document.getElementById('createReporter').value.trim(),
+                project: document.getElementById('createProject').value.trim(),
+                due: document.getElementById('createDue').value.trim(),
+                tags: document.getElementById('createTags').value.trim(),
+                member_of: document.getElementById('createMemberOf').value.trim(),
+                scope: document.getElementById('createScope').value,
+            };
+
+            const data = await api('/api/tickets', {
+                method: 'POST',
+                body: JSON.stringify(payload)
+            });
+
+            if (data && data.success) {
+                toast('Created ' + (data.id || 'ticket'));
+                closeModal('createModal');
+                /* clear form */
+                document.getElementById('createTitle').value = '';
+                document.getElementById('createAssignee').value = '';
+                document.getElementById('createReporter').value = '';
+                document.getElementById('createProject').value = '';
+                document.getElementById('createDue').value = '';
+                document.getElementById('createTags').value = '';
+                document.getElementById('createMemberOf').value = '';
+                refreshCurrentView();
+            } else {
+                toast(data?.message || 'Failed to create', 'error');
+            }
+        }
+
+        /* ============================================================ */
+        /* GIT SYNC                                                     */
+        /* ============================================================ */
+        async function gitSync() {
+            toast('Syncing...');
+            const data = await api('/api/sync', { method: 'POST' });
+            if (data && data.success) {
+                toast('Sync complete');
+            } else {
+                toast(data?.message || 'Sync failed', 'error');
+            }
+        }
+
+        /* ============================================================ */
+        /* MODALS                                                       */
+        /* ============================================================ */
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('active');
+        }
+
+        /* close on overlay click */
+        document.querySelectorAll('.modal-overlay').forEach(overlay => {
+            overlay.addEventListener('click', e => {
+                if (e.target === overlay) overlay.classList.remove('active');
+            });
+        });
+
+        /* close on Escape */
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.modal-overlay.active').forEach(m => m.classList.remove('active'));
+            }
+        });
+
+        /* ============================================================ */
+        /* REFRESH                                                      */
+        /* ============================================================ */
+        function refreshCurrentView() {
+            loadStats();
+            if (currentView === 'kanban') loadKanban();
+            else if (currentView === 'list') loadList();
+            else if (currentView === 'dashboard') loadDashboard('daily');
+            else if (currentView === 'people') loadPeople();
+        }
+
+        /* ============================================================ */
+        /* KEYBOARD SHORTCUTS                                           */
+        /* ============================================================ */
+        document.addEventListener('keydown', e => {
+            /* only when not focused on inputs */
+            if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)) return;
+
+            if (e.key === 'c') openCreateModal();
+            else if (e.key === 'r') refreshCurrentView();
+            else if (e.key === '1') { document.querySelector('.nav-tab:nth-child(1)').click(); }
+            else if (e.key === '2') { document.querySelector('.nav-tab:nth-child(2)').click(); }
+            else if (e.key === '3') { document.querySelector('.nav-tab:nth-child(3)').click(); }
+            else if (e.key === '4') { document.querySelector('.nav-tab:nth-child(4)').click(); }
+            else if (e.key === '/') { e.preventDefault(); document.querySelector('.view-panel.active .search-input')?.focus(); }
+            else if (e.key === 's' && !e.ctrlKey) gitSync();
+        });
+
+        /* ============================================================ */
+        /* INIT                                                         */
+        /* ============================================================ */
+        loadStats();
+        loadKanban();
+    </script>
+</body>
+</html>"""
+
+
+# ============================================================================
+# API ROUTES
+# ============================================================================
+@app.route('/')
+async def index():
+    """Serve the main HTML page."""
+    return HTML_TEMPLATE
+
+
+@app.route('/api/tickets')
+async def api_list_tickets():
+    """List tickets with optional filters."""
+    status: str = request.args.get('status', '')
+    ticket_type: str = request.args.get('type', '')
+    assignee: str = request.args.get('assignee', '')
+    priority: str = request.args.get('priority', '')
+    project: str = request.args.get('project', '')
+    scope: str = request.args.get('scope', '')
+    include_done: bool = request.args.get('include_done', 'false').lower() == 'true'
+
+    tickets: list[dict[str, Any]] = list_tickets(
+        status=status,
+        ticket_type=ticket_type,
+        assignee=assignee,
+        priority=priority,
+        project=project,
+        work=(scope == 'work'),
+        personal=(scope == 'personal'),
+        include_done=include_done,
+    )
+    return jsonify({'tickets': tickets})
+
+
+@app.route('/api/tickets', methods=['POST'])
+async def api_create_ticket():
+    """Create a new ticket."""
+    data: dict = await request.get_json()
+    if not data:
+        return jsonify({'success': False, 'message': 'No data provided'}), 400
+
+    success, msg = create_ticket(
+        ticket_type=data.get('type', 'task'),
+        title=data.get('title', ''),
+        priority=data.get('priority', 'medium'),
+        assignee=data.get('assignee', ''),
+        reporter=data.get('reporter', ''),
+        project=data.get('project', ''),
+        tags=data.get('tags', ''),
+        due=data.get('due', ''),
+        member_of=data.get('member_of', ''),
+        work=(data.get('scope') == 'work'),
+        personal=(data.get('scope') == 'personal'),
+    )
+
+    if success:
+        return jsonify({'success': True, 'id': msg})
+    return jsonify({'success': False, 'message': msg}), 400
+
+
+@app.route('/api/ticket/<ticket_id>')
+async def api_get_ticket(ticket_id: str):
+    """Get a single ticket."""
+    ticket: Optional[dict] = get_ticket(ticket_id)
+    if ticket is None:
+        return jsonify({'error': 'Ticket not found'}), 404
+    return jsonify({'ticket': ticket})
+
+
+@app.route('/api/ticket/<ticket_id>/move', methods=['POST'])
+async def api_move_ticket(ticket_id: str):
+    """Move a ticket to a new status."""
+    data: dict = await request.get_json()
+    new_status: str = data.get('status', '')
+    if not new_status:
+        return jsonify({'success': False, 'message': 'Status required'}), 400
+
+    success, msg = move_ticket(ticket_id, new_status)
+    return jsonify({'success': success, 'message': msg})
+
+
+@app.route('/api/ticket/<ticket_id>/comment', methods=['POST'])
+async def api_add_comment(ticket_id: str):
+    """Add a comment to a ticket."""
+    data: dict = await request.get_json()
+    text: str = data.get('text', '')
+    if not text:
+        return jsonify({'success': False, 'message': 'Comment text required'}), 400
+
+    success, msg = add_comment(ticket_id, text)
+    return jsonify({'success': success, 'message': msg})
+
+
+@app.route('/api/ticket/<ticket_id>/edit', methods=['POST'])
+async def api_edit_ticket(ticket_id: str):
+    """Edit ticket fields."""
+    data: dict = await request.get_json()
+    if not data:
+        return jsonify({'success': False, 'message': 'No data provided'}), 400
+
+    success, msg = edit_ticket(ticket_id, data)
+    return jsonify({'success': success, 'message': msg})
+
+
+@app.route('/api/dashboard/<dashboard_type>')
+async def api_dashboard(dashboard_type: str):
+    """Get dashboard content."""
+    content: str = get_dashboard(dashboard_type)
+    return jsonify({'content': content})
+
+
+@app.route('/api/people')
+async def api_people():
+    """List people."""
+    people: list[dict] = list_people()
+    return jsonify({'people': people})
+
+
+@app.route('/api/search')
+async def api_search():
+    """Search tickets."""
+    query: str = request.args.get('q', '')
+    if not query:
+        return jsonify({'tickets': []})
+    tickets: list[dict] = search_tickets(query)
+    return jsonify({'tickets': tickets})
+
+
+@app.route('/api/sync', methods=['POST'])
+async def api_sync():
+    """Git sync."""
+    success, msg = git_sync()
+    return jsonify({'success': success, 'message': msg})
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+async def main() -> None:
+    """Main entry point."""
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description='vimban web server',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  vimban_serve                  Start on default port (5005)
+  vimban_serve --port 8080      Start on port 8080
+  vimban_serve --bind 0.0.0.0   Listen on all interfaces"""
+    )
+    parser.add_argument(
+        '--bind', default=DEFAULT_BIND,
+        help=f'Address to bind to (default: {DEFAULT_BIND})'
+    )
+
+    # port from config, then default
+    config_port: str = _read_config_value("server_port", str(DEFAULT_PORT))
+    default_port: int = int(config_port) if config_port.isdigit() else DEFAULT_PORT
+
+    parser.add_argument(
+        '--port', type=int, default=default_port,
+        help=f'Port to bind to (default: {default_port})'
+    )
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--license', action='store_true', help='Show license')
+    parser.add_argument('-h2', '--help-keys', action='store_true', help='Show keyboard shortcuts')
+
+    args: argparse.Namespace = parser.parse_args()
+
+    if args.license:
+        print(LICENSE_TEXT)
+        return
+
+    if args.help_keys:
+        print("Keyboard shortcuts (when not focused on input):")
+        print("  c       Create new ticket")
+        print("  r       Refresh current view")
+        print("  s       Git sync")
+        print("  1-4     Switch views (Kanban, List, Dashboard, People)")
+        print("  /       Focus search")
+        print("  Esc     Close modals")
+        return
+
+    print(f"Starting vimban web server on http://{args.bind}:{args.port}")
+    print(f"  Kanban  : http://{args.bind}:{args.port}")
+    print(f"  API     : http://{args.bind}:{args.port}/api/tickets")
+    print()
+    await app.run_task(host=args.bind, port=args.port, debug=args.debug)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

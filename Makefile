@@ -25,7 +25,7 @@ help:
 install:
 	@echo "Installing vimban to $(PREFIX)..."
 	mkdir -p $(BINDIR) $(SHAREDIR)/templates $(CONFIGDIR)
-	cp bin/scripts/vimban bin/scripts/vimban_tui $(BINDIR)/
+	cp bin/scripts/vimban bin/scripts/vimban_tui bin/scripts/vimban_serve $(BINDIR)/
 	cp bin/scripts/vimban_task bin/scripts/vimban_bug $(BINDIR)/
 	cp bin/scripts/vimban_epic bin/scripts/vimban_story $(BINDIR)/
 	cp bin/scripts/vimban_subtask bin/scripts/vimban_research $(BINDIR)/
@@ -47,7 +47,7 @@ install:
 
 uninstall:
 	@echo "Removing vimban from $(PREFIX)..."
-	rm -f $(BINDIR)/vimban $(BINDIR)/vimban_tui
+	rm -f $(BINDIR)/vimban $(BINDIR)/vimban_tui $(BINDIR)/vimban_serve
 	rm -f $(BINDIR)/vimban_task $(BINDIR)/vimban_bug
 	rm -f $(BINDIR)/vimban_epic $(BINDIR)/vimban_story
 	rm -f $(BINDIR)/vimban_subtask $(BINDIR)/vimban_research
