@@ -713,10 +713,14 @@ class TUIConfig:
             default_layout=default_layout,
             default_view=default_view,
             theme=data.get('theme', 'catppuccin-mocha'),
-            kanban_columns=data.get('kanban', {}).get('columns', cls.kanban_columns),
+            kanban_columns=data.get('kanban', {}).get('columns', [
+                "backlog", "ready", "in_progress", "blocked", "review"
+            ]),
             kanban_hide_empty=data.get('kanban', {}).get('hide_empty', False),
             kanban_compact=data.get('kanban', {}).get('compact', False),
-            list_columns=data.get('list', {}).get('columns', cls.list_columns),
+            list_columns=data.get('list', {}).get('columns', [
+                "id", "status", "priority", "assignee", "title", "due_date"
+            ]),
             list_sort_by=data.get('list', {}).get('sort_by', 'due_date'),
             list_sort_reverse=data.get('list', {}).get('sort_reverse', False),
             split_ratio=split_ratio,
