@@ -1,0 +1,154 @@
+#!/bin/bash
+
+# vimban - Markdown-native ticket/kanban management system
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# vimban_mentor - Quick mentor meeting creation
+#
+# Usage:
+#   vimban_mentor <person>
+#   vimban_mentor <person> --mentored-by
+#   vimban_mentor <person> --date 2025-01-15
+#
+# Defaults:
+#   direction: mentoring (you are mentor)
+#   date: today
+
+set -euo pipefail
+
+show_help () {
+    cat <<EOF
+vimban_mentor - Quick mentor meeting creation
+
+Usage:
+    vimban_mentor [options] <person>
+    vimban_mentor <person> [vimban options]
+
+Defaults:
+    direction: mentoring (you are the mentor)
+    date: today
+
+Options:
+    -h, --help          Show this help message
+    --license           Show license (AGPLv3)
+    -d, --date DATE     Set meeting date (YYYY-MM-DD, default: today)
+    --mentored-by       You are the mentee (person is your mentor)
+    --work              Create in work scope
+    --personal          Create in personal scope
+    --no-edit           Don't open editor after creation (print file path)
+
+Any additional options are passed through to vimban mentor new.
+
+Examples:
+    vimban_mentor "John Smith"
+    vimban_mentor "My Manager" --mentored-by
+    vimban_mentor "Jane Doe" --date 2025-01-15
+    vimban_mentor --work "Team Lead"
+EOF
+}
+
+show_license () {
+    cat <<EOF
+vimban_mentor - Quick mentor meeting creation
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+EOF
+}
+
+# Default values
+meeting_date=""
+scope_arg=""
+no_edit=""
+
+# Passthrough args (person, other options)
+passthrough_args=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --license)
+            show_license
+            exit 0
+            ;;
+        -d|--date)
+            meeting_date="${2}"
+            shift 2
+            ;;
+        --work)
+            scope_arg="--work"
+            shift
+            ;;
+        --personal)
+            scope_arg="--personal"
+            shift
+            ;;
+        --no-edit)
+            no_edit="--no-edit"
+            shift
+            ;;
+        *)
+            passthrough_args+=("${1}")
+            shift
+            ;;
+    esac
+done
+
+# Check if we have at least a person in passthrough args
+if [[ ${#passthrough_args[@]} -lt 1 ]]
+then
+    echo "Error: Person reference required" >&2
+    echo "Usage: vimban_mentor [options] <person>" >&2
+    exit 1
+fi
+
+# Build the command
+cmd_args=("mentor" "new")
+
+# Add date if specified
+if [[ -n "${meeting_date}" ]]
+then
+    cmd_args+=("--date" "${meeting_date}")
+fi
+
+# Add --no-edit if specified
+if [[ -n "${no_edit}" ]]
+then
+    cmd_args+=("--no-edit")
+fi
+
+# Add all passthrough args
+cmd_args+=("${passthrough_args[@]}")
+
+# Execute the command
+# shellcheck disable=SC2086
+exec vimban ${scope_arg} "${cmd_args[@]}"

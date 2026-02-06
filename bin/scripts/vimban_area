@@ -1,0 +1,135 @@
+#!/bin/bash
+
+# vimban - Markdown-native ticket/kanban management system
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# vimban_area - Quick area creation for ongoing responsibilities
+#
+# Usage:
+#   vimban_area "Area title"
+#   vimban_area "Area title" -t "technical/linux"
+#   vimban_area --work "Work area"
+#
+# Areas are ongoing responsibilities with standards to maintain.
+# Unlike tasks, they don't have due dates or priorities.
+#
+# Defaults:
+#   reporter: zach_podbielniak
+
+set -euo pipefail
+
+show_help () {
+    cat <<EOF
+vimban_area - Quick area creation for ongoing responsibilities
+
+Usage:
+    vimban_area [options] "Area title"
+    vimban_area "Area title" [vimban options]
+
+Areas are ongoing responsibilities with standards to maintain.
+Unlike tasks, they don't have due dates or priorities.
+
+Defaults:
+    reporter: zach_podbielniak
+
+Options:
+    -h, --help          Show this help message
+    -t, --topic PATH    Set topic path (e.g., 'technical/linux')
+    --work              Create in work scope
+    --personal          Create in personal scope
+    -r, --reporter REF  Override reporter (default: zach_podbielniak)
+    --no-edit           Don't open editor after creation (print file path)
+
+Any additional options are passed through to vimban create area.
+
+Examples:
+    vimban_area "Home maintenance"
+    vimban_area "Linux administration" -t "technical/linux"
+    vimban_area --work "Team processes"
+    vimban_area --personal "Health and fitness"
+EOF
+}
+
+# Default values
+topic=""
+scope_arg=""
+reporter="${VIMBAN_REPORTER:-}"
+no_edit=""
+
+# Passthrough args (title, other options)
+passthrough_args=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -t|--topic)
+            topic="${2}"
+            shift 2
+            ;;
+        --work)
+            scope_arg="--work"
+            shift
+            ;;
+        --personal)
+            scope_arg="--personal"
+            shift
+            ;;
+        -r|--reporter)
+            reporter="${2}"
+            shift 2
+            ;;
+        --no-edit)
+            no_edit="--no-edit"
+            shift
+            ;;
+        *)
+            passthrough_args+=("${1}")
+            shift
+            ;;
+    esac
+done
+
+# Check if we have at least a title in passthrough args
+if [[ ${#passthrough_args[@]} -lt 1 ]]
+then
+    echo "Error: Area title required" >&2
+    echo "Usage: vimban_area [options] \"Area title\"" >&2
+    exit 1
+fi
+
+# Build the command
+# shellcheck disable=SC2086
+cmd=(vimban ${scope_arg} create area -r "${reporter}")
+
+# Add topic if specified
+if [[ -n "${topic}" ]]
+then
+    cmd+=(--topic "${topic}")
+fi
+
+# Add --no-edit if specified
+if [[ -n "${no_edit}" ]]
+then
+    cmd+=(--no-edit)
+fi
+
+# Add passthrough args and execute
+exec "${cmd[@]}" "${passthrough_args[@]}"

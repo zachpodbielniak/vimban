@@ -1,0 +1,139 @@
+#!/bin/bash
+
+# vimban - Markdown-native ticket/kanban management system
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# vimban_task - Quick task creation with sensible defaults
+#
+# Usage:
+#   vimban_task "Task title"
+#   vimban_task "Task title" -p high
+#   vimban_task "Task title" --due +3d
+#   vimban_task --work "Work task"
+#
+# Defaults:
+#   assignee: zach_podbielniak
+#   reporter: zach_podbielniak
+#   due_date: +7d (1 week from now)
+#   priority: medium
+
+set -euo pipefail
+
+show_help () {
+    cat <<EOF
+vimban_task - Quick task creation with sensible defaults
+
+Usage:
+    vimban_task [options] "Task title"
+    vimban_task "Task title" [vimban options]
+
+Defaults:
+    assignee: zach_podbielniak
+    reporter: zach_podbielniak
+    due_date: +7d (1 week from now)
+    priority: medium
+
+Options:
+    -h, --help          Show this help message
+    -p, --priority PRI  Override priority (critical|high|medium|low)
+    --due DATE          Override due date (+Nd, YYYY-MM-DD, etc.)
+    -a, --assignee REF  Override assignee
+    -r, --reporter REF  Override reporter
+    --work              Create in work scope
+    --personal          Create in personal scope
+    --no-edit           Don't open editor after creation (print file path)
+
+Any additional options are passed through to vimban create task.
+
+Examples:
+    vimban_task "Fix the login bug"
+    vimban_task "Urgent fix" -p critical --due +1d
+    vimban_task --work "Review PR"
+    vimban_task --personal "Buy groceries" -p low
+EOF
+}
+
+# Default values
+assignee="${VIMBAN_ASSIGNEE:-}"
+reporter="${VIMBAN_REPORTER:-}"
+due_date="+7d"
+priority="medium"
+scope_arg=""
+no_edit=""
+
+# Passthrough args (title, other options)
+passthrough_args=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -p|--priority)
+            priority="${2}"
+            shift 2
+            ;;
+        --due)
+            due_date="${2}"
+            shift 2
+            ;;
+        -a|--assignee)
+            assignee="${2}"
+            shift 2
+            ;;
+        -r|--reporter)
+            reporter="${2}"
+            shift 2
+            ;;
+        --work)
+            scope_arg="--work"
+            shift
+            ;;
+        --personal)
+            scope_arg="--personal"
+            shift
+            ;;
+        --no-edit)
+            no_edit="--no-edit"
+            shift
+            ;;
+        *)
+            passthrough_args+=("${1}")
+            shift
+            ;;
+    esac
+done
+
+# Check if we have at least a title in passthrough args
+if [[ ${#passthrough_args[@]} -lt 1 ]]
+then
+    echo "Error: Task title required" >&2
+    echo "Usage: vimban_task [options] \"Task title\"" >&2
+    exit 1
+fi
+
+# Build and execute the command
+# shellcheck disable=SC2086
+exec vimban ${scope_arg} create task \
+    -a "${assignee}" \
+    -r "${reporter}" \
+    --due "${due_date}" \
+    -p "${priority}" \
+    ${no_edit} \
+    "${passthrough_args[@]}"

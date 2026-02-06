@@ -1,0 +1,152 @@
+# vimban configuration
+# Copy this file to ~/.config/vimban/config.yaml and customize
+#
+# Environment variables take precedence over this file.
+# See docs/configuration.md for full reference.
+
+# ============================================================================
+# User Identity
+# ============================================================================
+
+# Default reporter and assignee for new tickets
+# Used by bash wrapper scripts (vimban_task, vimban_bug, etc.)
+# Env: VIMBAN_REPORTER, VIMBAN_ASSIGNEE
+reporter: ""
+assignee: ""
+
+# ============================================================================
+# Directories
+# ============================================================================
+
+# Root directory for vimban notes/tickets
+# Env: VIMBAN_DIR
+# Default: ~/Documents/notes
+directory: "~/Documents/notes"
+
+# People directory (relative to root directory)
+# Env: VIMBAN_PEOPLE_DIR
+# Default: 02_areas/work/people
+people_dir: "02_areas/work/people"
+
+# Template directory override
+# Env: VIMBAN_TEMPLATE_DIR
+# Default: auto-detected (submodule > dotfiles > relative > XDG)
+# template_dir: ""
+
+# ============================================================================
+# Ticket Defaults
+# ============================================================================
+
+# Default ticket prefix for project types (epic, story, task, sub-task)
+# Default: PROJ
+default_prefix: "PROJ"
+
+# Default priority for new tickets
+# Options: critical, high, medium, low
+# Default: medium
+default_priority: "medium"
+
+# Default due date offset for new tickets (relative format)
+# Examples: +7d (7 days), +14d (2 weeks), +30d (1 month)
+# Default: +7d
+default_due: "+7d"
+
+# Default scope when not specified
+# Options: work, personal
+# Default: personal
+default_scope: "personal"
+
+# ============================================================================
+# Ticket ID Prefixes
+# ============================================================================
+# Customize the ID prefix for each ticket type
+# prefixes:
+#   epic: "PROJ"
+#   story: "PROJ"
+#   task: "PROJ"
+#   sub-task: "PROJ"
+#   research: "RESEARCH"
+#   bug: "BUG"
+#   person: "PERSON"
+#   area: "AREA"
+#   resource: "RESOURCE"
+#   meeting: "MTG"
+#   journal: "JNL"
+#   recipe: "RCP"
+#   mentorship: "MNTR"
+
+# ============================================================================
+# Distrobox Integration
+# ============================================================================
+
+# Distrobox container name for auto re-exec
+# Set to empty string or use NO_DBOX_CHECK=1 to disable
+# Env: VIMBAN_DISTROBOX
+# Default: dev
+distrobox: "dev"
+
+# ============================================================================
+# TUI Settings
+# ============================================================================
+
+tui:
+    # Default layout: kanban, list, split
+    default_layout: "kanban"
+
+    # Default view: tickets, people, kanban, dashboard, reports, mentorship
+    default_view: "tickets"
+
+    # Kanban board settings
+    kanban:
+        # Columns to display
+        columns:
+            - "backlog"
+            - "ready"
+            - "in_progress"
+            - "blocked"
+            - "review"
+        # Hide columns with no tickets
+        hide_empty: false
+        # Compact card display
+        compact: false
+
+    # List view settings
+    list:
+        # Columns to display
+        columns:
+            - "id"
+            - "status"
+            - "priority"
+            - "assignee"
+            - "title"
+            - "due_date"
+        # Sort field
+        sort_by: "due_date"
+        # Reverse sort order
+        sort_reverse: false
+
+    # Split view settings
+    split:
+        # Ratio (left panel %, right panel %)
+        ratio: [40, 60]
+        # Show ticket body in right panel
+        show_body: true
+
+    # Done/completed ticket filtering
+    done:
+        # Exclude done tickets by default
+        exclude: true
+        # Show done tickets from last N days
+        show_days: 7
+
+# ============================================================================
+# Scope Detection
+# ============================================================================
+# Path patterns used to detect work vs personal scope
+# scope_detection:
+#   work_patterns:
+#     - "/work/"
+#     - "01_projects/work"
+#   personal_patterns:
+#     - "/personal/"
+#     - "01_projects/personal"

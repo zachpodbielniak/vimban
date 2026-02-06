@@ -1,0 +1,120 @@
+#!/bin/bash
+
+# vimban - Markdown-native ticket/kanban management system
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# vimban_meeting - Quick meeting record creation
+#
+# Usage:
+#   vimban_meeting "Meeting title"
+#   vimban_meeting "Meeting title" --date 2025-01-15
+#   vimban_meeting --work "Team standup"
+#
+# Defaults:
+#   ticket_date: today
+#   reporter: zach_podbielniak
+
+set -euo pipefail
+
+show_help () {
+    cat <<EOF
+vimban_meeting - Quick meeting record creation
+
+Usage:
+    vimban_meeting [options] "Meeting title"
+    vimban_meeting "Meeting title" [vimban options]
+
+Defaults:
+    ticket_date: today
+    reporter: zach_podbielniak
+
+Options:
+    -h, --help          Show this help message
+    -d, --date DATE     Set meeting date (YYYY-MM-DD, default: today)
+    --work              Create in work scope
+    --personal          Create in personal scope
+    -r, --reporter REF  Override reporter (default: zach_podbielniak)
+    --no-edit           Don't open editor after creation (print file path)
+
+Any additional options are passed through to vimban create meeting.
+
+Examples:
+    vimban_meeting "Weekly team sync"
+    vimban_meeting "1:1 with manager" --date 2025-01-15
+    vimban_meeting --work "Sprint planning"
+    vimban_meeting --personal "Family planning meeting"
+EOF
+}
+
+# Default values
+ticket_date="$(date +%Y-%m-%d)"
+scope_arg=""
+reporter="${VIMBAN_REPORTER:-}"
+no_edit=""
+
+# Passthrough args (title, other options)
+passthrough_args=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -d|--date)
+            ticket_date="${2}"
+            shift 2
+            ;;
+        --work)
+            scope_arg="--work"
+            shift
+            ;;
+        --personal)
+            scope_arg="--personal"
+            shift
+            ;;
+        -r|--reporter)
+            reporter="${2}"
+            shift 2
+            ;;
+        --no-edit)
+            no_edit="--no-edit"
+            shift
+            ;;
+        *)
+            passthrough_args+=("${1}")
+            shift
+            ;;
+    esac
+done
+
+# Check if we have at least a title in passthrough args
+if [[ ${#passthrough_args[@]} -lt 1 ]]
+then
+    echo "Error: Meeting title required" >&2
+    echo "Usage: vimban_meeting [options] \"Meeting title\"" >&2
+    exit 1
+fi
+
+# Build and execute the command
+# shellcheck disable=SC2086
+exec vimban ${scope_arg} create meeting \
+    --date "${ticket_date}" \
+    -r "${reporter}" \
+    ${no_edit} \
+    "${passthrough_args[@]}"

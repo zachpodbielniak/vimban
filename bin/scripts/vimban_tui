@@ -1,0 +1,3624 @@
+#!/usr/bin/python3
+
+# vimban - Markdown-native ticket/kanban management system
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+vimban_tui - Curses-based TUI for vimban ticket management
+
+A text-based user interface for interacting with vimban, providing
+vim-style navigation, multiple layout views (kanban, list, split),
+and full CRUD operations on tickets and people.
+
+Usage:
+    vimban_tui [options]
+    vimban tui [options]
+
+Examples:
+    vimban_tui
+    vimban_tui --layout kanban
+    vimban_tui --view people
+    vimban tui --directory ~/projects/myproject
+"""
+
+# ============================================================================
+# DISTROBOX CHECK (Before any other imports)
+# ============================================================================
+from os import environ
+from subprocess import run
+from sys import argv, exit as sys_exit
+
+
+ctr_id: str | None = ""
+
+if ("CONTAINER_ID" in environ):
+    ctr_id = environ.get("CONTAINER_ID")
+
+# Check if distrobox check should be skipped
+no_dbox_check: bool = environ.get("NO_DBOX_CHECK", "").lower() in ("1", "true")
+
+# if we are not in the target distrobox re-exec the script
+# inside of the target distrobox
+_dbox_target: str = environ.get("VIMBAN_DISTROBOX", "dev")
+if not no_dbox_check and (_dbox_target != ctr_id):
+    cmd: list[str] = [
+        "distrobox",
+        "enter",
+        _dbox_target,
+        "--",
+        *argv
+    ]
+
+    run(cmd)
+    sys_exit(0)
+
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+import argparse
+import curses
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from enum import Enum
+from pathlib import Path
+from typing import Optional, Any, Callable
+
+import yaml
+
+# Optional markdown rendering support
+try:
+    import mistune
+    HAS_MISTUNE: bool = True
+except ImportError:
+    HAS_MISTUNE: bool = False
+
+# Import from vimban (same directory, loaded as module)
+# Set NO_DBOX_CHECK to prevent vimban from doing its own distrobox re-exec
+# since vimban_tui already handles this above
+os.environ["NO_DBOX_CHECK"] = "1"
+
+import importlib.util
+import importlib.machinery
+vimban_path: Path = Path(__file__).parent / "vimban"
+loader = importlib.machinery.SourceFileLoader("vimban", str(vimban_path))
+spec = importlib.util.spec_from_loader("vimban", loader)
+if spec is None or spec.loader is None:
+    print("Error: Could not load vimban module", file=sys.stderr)
+    sys_exit(1)
+vimban = importlib.util.module_from_spec(spec)
+sys.modules["vimban"] = vimban
+spec.loader.exec_module(vimban)
+
+# Import needed components from vimban
+Config = vimban.Config
+Ticket = vimban.Ticket
+Person = vimban.Person
+TransclusionLink = vimban.TransclusionLink
+fallback_list_tickets = vimban.fallback_list_tickets
+find_ticket = vimban.find_ticket
+find_person = vimban.find_person
+parse_frontmatter = vimban.parse_frontmatter
+dump_frontmatter = vimban.dump_frontmatter
+STATUSES = vimban.STATUSES
+TICKET_TYPES = vimban.TICKET_TYPES
+PARA_TYPES = vimban.PARA_TYPES
+ALL_TYPES = vimban.ALL_TYPES
+PRIORITIES = vimban.PRIORITIES
+DEFAULT_DIR = vimban.DEFAULT_DIR
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+VERSION: str = "0.1.0"
+MIN_WIDTH: int = 80
+MIN_HEIGHT: int = 24
+AUTO_REFRESH_INTERVAL: int = 30  # seconds
+
+LICENSE_TEXT: str = """vimban_tui - Curses-based TUI for vimban ticket management
+Copyright (C) 2025  Zach Podbielniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>."""
+
+
+# ============================================================================
+# ENUMS
+# ============================================================================
+class ViewType(Enum):
+    """Available view types in the TUI."""
+    TICKETS = "tickets"
+    PEOPLE = "people"
+    KANBAN = "kanban"
+    DASHBOARD = "dashboard"
+    REPORTS = "reports"
+    MENTORSHIP = "mentorship"
+
+
+class LayoutType(Enum):
+    """Available layout types for displaying items."""
+    KANBAN = "kanban"
+    LIST = "list"
+    SPLIT = "split"
+
+
+# ============================================================================
+# THEME MANAGER
+# ============================================================================
+class ThemeManager:
+    """
+    Manages color themes for the TUI.
+
+    Supports Catppuccin Mocha theme with color pairs for
+    various UI elements like statuses, priorities, and chrome.
+    """
+
+    # Catppuccin Mocha color palette (256-color approximations)
+    CATPPUCCIN_MOCHA: dict[str, int] = {
+        "rosewater": 217,
+        "flamingo": 216,
+        "pink": 211,
+        "mauve": 183,
+        "red": 203,
+        "maroon": 210,
+        "peach": 215,
+        "yellow": 222,
+        "green": 149,
+        "teal": 116,
+        "sky": 117,
+        "sapphire": 110,
+        "blue": 111,
+        "lavender": 147,
+        "text": 253,
+        "subtext1": 246,
+        "subtext0": 245,
+        "overlay2": 244,
+        "overlay1": 240,
+        "overlay0": 239,
+        "surface2": 238,
+        "surface1": 237,
+        "surface0": 236,
+        "base": 235,
+        "mantle": 234,
+        "crust": 233,
+    }
+
+    # Color pair indices
+    PAIR_HEADER: int = 1
+    PAIR_SELECTED: int = 2
+    PAIR_BORDER: int = 3
+    PAIR_STATUS_BAR: int = 4
+    PAIR_ERROR: int = 5
+    PAIR_SUCCESS: int = 6
+    PAIR_HELP: int = 7
+    # Status colors (10-17)
+    PAIR_STATUS_BACKLOG: int = 10
+    PAIR_STATUS_READY: int = 11
+    PAIR_STATUS_IN_PROGRESS: int = 12
+    PAIR_STATUS_BLOCKED: int = 13
+    PAIR_STATUS_REVIEW: int = 14
+    PAIR_STATUS_DELEGATED: int = 15
+    PAIR_STATUS_DONE: int = 16
+    PAIR_STATUS_CANCELLED: int = 17
+    # Priority colors (20-23)
+    PAIR_PRIORITY_CRITICAL: int = 20
+    PAIR_PRIORITY_HIGH: int = 21
+    PAIR_PRIORITY_MEDIUM: int = 22
+    PAIR_PRIORITY_LOW: int = 23
+    # Markdown colors (30-33)
+    PAIR_MD_HEADING: int = 30
+    PAIR_MD_CODE: int = 31
+    PAIR_MD_QUOTE: int = 32
+    PAIR_MD_LINK: int = 33
+    # Assignee colors (40-47)
+    PAIR_ASSIGNEE_0: int = 40
+    PAIR_ASSIGNEE_1: int = 41
+    PAIR_ASSIGNEE_2: int = 42
+    PAIR_ASSIGNEE_3: int = 43
+    PAIR_ASSIGNEE_4: int = 44
+    PAIR_ASSIGNEE_5: int = 45
+    PAIR_ASSIGNEE_6: int = 46
+    PAIR_ASSIGNEE_7: int = 47
+
+    @classmethod
+    def apply_theme(cls) -> None:
+        """
+        Apply the Catppuccin Mocha theme to curses color pairs.
+
+        Must be called after curses.initscr() and before drawing.
+        """
+        if not curses.has_colors():
+            return
+
+        curses.start_color()
+        curses.use_default_colors()
+
+        c: dict[str, int] = cls.CATPPUCCIN_MOCHA
+
+        # UI chrome colors
+        curses.init_pair(cls.PAIR_HEADER, c["lavender"], c["surface0"])
+        curses.init_pair(cls.PAIR_SELECTED, c["text"], c["surface1"])
+        curses.init_pair(cls.PAIR_BORDER, c["surface2"], -1)
+        curses.init_pair(cls.PAIR_STATUS_BAR, c["subtext1"], c["surface0"])
+        curses.init_pair(cls.PAIR_ERROR, c["red"], -1)
+        curses.init_pair(cls.PAIR_SUCCESS, c["green"], -1)
+        curses.init_pair(cls.PAIR_HELP, c["subtext0"], -1)
+
+        # Status colors
+        curses.init_pair(cls.PAIR_STATUS_BACKLOG, c["overlay0"], -1)
+        curses.init_pair(cls.PAIR_STATUS_READY, c["blue"], -1)
+        curses.init_pair(cls.PAIR_STATUS_IN_PROGRESS, c["sky"], -1)
+        curses.init_pair(cls.PAIR_STATUS_BLOCKED, c["red"], -1)
+        curses.init_pair(cls.PAIR_STATUS_REVIEW, c["yellow"], -1)
+        curses.init_pair(cls.PAIR_STATUS_DELEGATED, c["mauve"], -1)
+        curses.init_pair(cls.PAIR_STATUS_DONE, c["green"], -1)
+        curses.init_pair(cls.PAIR_STATUS_CANCELLED, c["overlay0"], -1)
+
+        # Priority colors
+        curses.init_pair(cls.PAIR_PRIORITY_CRITICAL, c["red"], -1)
+        curses.init_pair(cls.PAIR_PRIORITY_HIGH, c["peach"], -1)
+        curses.init_pair(cls.PAIR_PRIORITY_MEDIUM, c["text"], -1)
+        curses.init_pair(cls.PAIR_PRIORITY_LOW, c["overlay1"], -1)
+
+        # Markdown colors
+        curses.init_pair(cls.PAIR_MD_HEADING, c["mauve"], -1)
+        curses.init_pair(cls.PAIR_MD_CODE, c["green"], -1)
+        curses.init_pair(cls.PAIR_MD_QUOTE, c["overlay0"], -1)
+        curses.init_pair(cls.PAIR_MD_LINK, c["sapphire"], -1)
+
+        # Assignee colors (distinct, high-contrast colors)
+        curses.init_pair(cls.PAIR_ASSIGNEE_0, c["rosewater"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_1, c["flamingo"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_2, c["pink"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_3, c["mauve"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_4, c["peach"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_5, c["teal"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_6, c["sapphire"], -1)
+        curses.init_pair(cls.PAIR_ASSIGNEE_7, c["lavender"], -1)
+
+    @classmethod
+    def get_status_pair(cls, status: str) -> int:
+        """Get the color pair index for a status."""
+        status_pairs: dict[str, int] = {
+            "backlog": cls.PAIR_STATUS_BACKLOG,
+            "ready": cls.PAIR_STATUS_READY,
+            "in_progress": cls.PAIR_STATUS_IN_PROGRESS,
+            "blocked": cls.PAIR_STATUS_BLOCKED,
+            "review": cls.PAIR_STATUS_REVIEW,
+            "delegated": cls.PAIR_STATUS_DELEGATED,
+            "done": cls.PAIR_STATUS_DONE,
+            "cancelled": cls.PAIR_STATUS_CANCELLED,
+        }
+        return status_pairs.get(status, cls.PAIR_STATUS_BACKLOG)
+
+    @classmethod
+    def get_priority_pair(cls, priority: str) -> int:
+        """Get the color pair index for a priority."""
+        priority_pairs: dict[str, int] = {
+            "critical": cls.PAIR_PRIORITY_CRITICAL,
+            "high": cls.PAIR_PRIORITY_HIGH,
+            "medium": cls.PAIR_PRIORITY_MEDIUM,
+            "low": cls.PAIR_PRIORITY_LOW,
+        }
+        return priority_pairs.get(priority, cls.PAIR_PRIORITY_MEDIUM)
+
+    @classmethod
+    def get_assignee_pair(cls, assignee_name: str) -> int:
+        """Get the color pair index for an assignee (consistent by name hash)."""
+        if not assignee_name:
+            return cls.PAIR_PRIORITY_MEDIUM  # fallback to default text color
+        # Special case for clawdbot - use pink
+        if assignee_name.lower() == "clawdbot":
+            return cls.PAIR_ASSIGNEE_2  # pink
+        # Use hash to consistently map same name to same color
+        color_idx: int = hash(assignee_name.lower()) % 8
+        return cls.PAIR_ASSIGNEE_0 + color_idx
+
+
+# ============================================================================
+# MARKDOWN RENDERER
+# ============================================================================
+class MarkdownRenderer:
+    """
+    Renders markdown tokens to curses-compatible (text, attr) tuples.
+
+    Uses mistune to parse markdown into AST, then converts each token
+    to styled text segments for curses rendering.
+    """
+
+    def __init__(self):
+        if HAS_MISTUNE:
+            self._parser = mistune.create_markdown(renderer=None)
+        else:
+            self._parser = None
+
+    def render(self, text: str, width: int) -> list[list[tuple[str, int]]]:
+        """
+        Render markdown text to styled lines.
+
+        Args:
+            text: Raw markdown text
+            width: Maximum line width for wrapping
+
+        Returns:
+            List of lines, each line is list of (text, curses_attr) tuples
+        """
+        if not self._parser:
+            return [[(line, 0)] for line in text.split('\n')]
+
+        tokens = self._parser(text)
+        lines: list[list[tuple[str, int]]] = []
+        current_line: list[tuple[str, int]] = []
+
+        for token in tokens:
+            self._render_token(token, lines, current_line, width)
+
+        if current_line:
+            lines.append(current_line)
+
+        return lines
+
+    def _render_token(self, token: dict, lines: list, current_line: list,
+                      width: int) -> None:
+        """Recursively render a token and its children."""
+        token_type: str = token.get('type', '')
+
+        if token_type == 'heading':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            level: int = token.get('attrs', {}).get('level', 1)
+            prefix: str = '#' * level + ' '
+            text: str = self._extract_text(token)
+            attr: int = curses.A_BOLD | curses.color_pair(ThemeManager.PAIR_MD_HEADING)
+            lines.append([(prefix + text, attr)])
+            lines.append([('', 0)])
+
+        elif token_type == 'paragraph':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            self._render_children(token, lines, current_line, width)
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            lines.append([('', 0)])
+
+        elif token_type == 'code_block':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            code: str = token.get('raw', '')
+            attr: int = curses.color_pair(ThemeManager.PAIR_MD_CODE)
+            for code_line in code.rstrip('\n').split('\n'):
+                lines.append([(code_line, attr)])
+            lines.append([('', 0)])
+
+        elif token_type == 'block_quote':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            text: str = self._extract_text(token)
+            attr: int = curses.color_pair(ThemeManager.PAIR_MD_QUOTE)
+            for quote_line in text.split('\n'):
+                lines.append([('> ' + quote_line, attr)])
+            lines.append([('', 0)])
+
+        elif token_type == 'list':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+            ordered: bool = token.get('attrs', {}).get('ordered', False)
+            for i, item in enumerate(token.get('children', [])):
+                prefix: str = f"{i+1}. " if ordered else "• "
+                text: str = self._extract_text(item)
+                lines.append([(prefix + text, 0)])
+            lines.append([('', 0)])
+
+        elif token_type == 'strong':
+            text: str = self._extract_text(token)
+            current_line.append((text, curses.A_BOLD))
+
+        elif token_type == 'emphasis':
+            text: str = self._extract_text(token)
+            current_line.append((text, curses.A_DIM))
+
+        elif token_type == 'codespan':
+            text: str = token.get('raw', '')
+            current_line.append((text, curses.color_pair(ThemeManager.PAIR_MD_CODE)))
+
+        elif token_type == 'link':
+            text: str = self._extract_text(token)
+            attr: int = curses.color_pair(ThemeManager.PAIR_MD_LINK) | curses.A_UNDERLINE
+            current_line.append((text, attr))
+
+        elif token_type == 'text':
+            text: str = token.get('raw', '')
+            current_line.append((text, 0))
+
+        elif token_type == 'softbreak':
+            current_line.append((' ', 0))
+
+        elif token_type == 'linebreak':
+            if current_line:
+                lines.append(current_line[:])
+                current_line.clear()
+
+        else:
+            self._render_children(token, lines, current_line, width)
+
+    def _render_children(self, token: dict, lines: list, current_line: list,
+                         width: int) -> None:
+        """Render all children of a token."""
+        for child in token.get('children', []):
+            self._render_token(child, lines, current_line, width)
+
+    def _extract_text(self, token: dict) -> str:
+        """Extract plain text from a token and its children."""
+        if 'raw' in token:
+            return token['raw']
+        text: str = ''
+        for child in token.get('children', []):
+            text += self._extract_text(child)
+        return text
+
+
+# ============================================================================
+# TUI CONFIGURATION
+# ============================================================================
+@dataclass
+class TUIConfig:
+    """
+    Configuration for the TUI interface.
+
+    Loaded from ~/.config/vimban/config.yaml with defaults
+    for all settings.
+    """
+    default_layout: LayoutType = LayoutType.KANBAN
+    default_view: ViewType = ViewType.TICKETS
+    theme: str = "catppuccin-mocha"
+
+    # Kanban layout settings
+    kanban_columns: list[str] = field(default_factory=lambda: [
+        "backlog", "ready", "in_progress", "blocked", "review"
+    ])
+    kanban_hide_empty: bool = False
+    kanban_compact: bool = False
+
+    # List layout settings
+    list_columns: list[str] = field(default_factory=lambda: [
+        "id", "status", "priority", "assignee", "title", "due_date"
+    ])
+    list_sort_by: str = "due_date"
+    list_sort_reverse: bool = False
+
+    # Split layout settings
+    split_ratio: tuple[int, int] = (40, 60)
+    split_show_body: bool = True
+    split_render_markdown: bool = True  # Styled markdown rendering
+
+    # Filter defaults
+    filter_exclude_done: bool = True
+    done_last_days: Optional[int] = 7  # None = hide all done, 0 = all done, N = last N days
+    scope: Optional[str] = None  # 'work', 'personal', or None (both)
+    include_archived: bool = False  # Include 04_archives/ items
+
+    @classmethod
+    def load(cls) -> "TUIConfig":
+        """
+        Load configuration from ~/.config/vimban/config.yaml.
+
+        Returns default configuration if file doesn't exist.
+        """
+        config_path: Path = Path.home() / ".config" / "vimban" / "config.yaml"
+        if not config_path.exists():
+            return cls()
+
+        try:
+            with open(config_path, 'r') as f:
+                data: dict = yaml.safe_load(f) or {}
+        except (yaml.YAMLError, OSError):
+            return cls()
+
+        # Parse layout enum
+        default_layout: LayoutType = LayoutType.KANBAN
+        layout_str: str = data.get('default_layout', 'kanban')
+        try:
+            default_layout = LayoutType(layout_str)
+        except ValueError:
+            pass
+
+        # Parse view enum
+        default_view: ViewType = ViewType.TICKETS
+        view_str: str = data.get('default_view', 'tickets')
+        try:
+            default_view = ViewType(view_str)
+        except ValueError:
+            pass
+
+        # Parse split ratio
+        split_ratio: tuple[int, int] = (40, 60)
+        ratio_str: str = data.get('split', {}).get('ratio', '40:60')
+        if ':' in str(ratio_str):
+            parts: list[str] = str(ratio_str).split(':')
+            if len(parts) == 2:
+                try:
+                    split_ratio = (int(parts[0]), int(parts[1]))
+                except ValueError:
+                    pass
+
+        return cls(
+            default_layout=default_layout,
+            default_view=default_view,
+            theme=data.get('theme', 'catppuccin-mocha'),
+            kanban_columns=data.get('kanban', {}).get('columns', cls.kanban_columns),
+            kanban_hide_empty=data.get('kanban', {}).get('hide_empty', False),
+            kanban_compact=data.get('kanban', {}).get('compact', False),
+            list_columns=data.get('list', {}).get('columns', cls.list_columns),
+            list_sort_by=data.get('list', {}).get('sort_by', 'due_date'),
+            list_sort_reverse=data.get('list', {}).get('sort_reverse', False),
+            split_ratio=split_ratio,
+            split_show_body=data.get('split', {}).get('show_body', True),
+            split_render_markdown=data.get('split', {}).get('render_markdown', True),
+            filter_exclude_done=data.get('filters', {}).get('exclude_done', True),
+            done_last_days=data.get('filters', {}).get('done_last_days', 7),
+        )
+
+    def get_kanban_columns(self) -> list[str]:
+        """
+        Get effective kanban columns, auto-adding 'done' if done_last_days is set.
+
+        Returns:
+            List of status columns to display in kanban view
+        """
+        columns: list[str] = self.kanban_columns.copy()
+        if self.done_last_days is not None and 'done' not in columns:
+            columns.append('done')
+        return columns
+
+
+# ============================================================================
+# APPLICATION STATE
+# ============================================================================
+@dataclass
+class AppState:
+    """
+    Central application state for the TUI.
+
+    Tracks the current view, layout, selection, and cached data.
+    All state modifications should maintain UI consistency.
+    """
+    # View and layout state
+    current_view: ViewType = ViewType.TICKETS
+    current_layout: LayoutType = LayoutType.KANBAN
+
+    # Selection state
+    selected_row: int = 0
+    selected_col: int = 0
+    scroll_offset: int = 0
+    detail_scroll: int = 0
+    kanban_scroll_offsets: dict[int, int] = field(default_factory=dict)  # per-column scroll offsets
+    kanban_cards_per_col: int = 0  # visible cards per column, set during render
+
+    # Data cache
+    tickets: list[Ticket] = field(default_factory=list)
+    people: list[Person] = field(default_factory=list)
+    kanban_board: dict[str, list[Ticket]] = field(default_factory=dict)
+    mentorship_meetings: list[Ticket] = field(default_factory=list)
+
+    # Filter state
+    status_filter: Optional[list[str]] = None
+    type_filter: Optional[list[str]] = None
+    search_query: Optional[str] = None
+
+    # UI state
+    show_help: bool = False
+    render_markdown: bool = True  # Toggle with 'r' key
+    status_message: str = ""
+    status_is_error: bool = False
+
+    # Vim motion state (for compound motions like 'gg')
+    pending_motion: str = ""
+
+
+# ============================================================================
+# SCOPE DETECTION HELPER
+# ============================================================================
+def detect_scope_from_path(filepath: Path, notes_dir: Path) -> str:
+    """
+    Detect work/personal scope from file path.
+
+    Checks if path is under a 'work' subdirectory.
+    Defaults to 'personal' for all other paths.
+
+    Args:
+        filepath: Path to the file
+        notes_dir: Base notes directory
+
+    Returns:
+        'work' or 'personal'
+    """
+    try:
+        rel_path: Path = filepath.relative_to(notes_dir)
+        parts: tuple[str, ...] = rel_path.parts
+        if len(parts) >= 2 and parts[1] == 'work':
+            return 'work'
+        return 'personal'
+    except ValueError:
+        return 'personal'
+
+
+# ============================================================================
+# STATE MANAGER
+# ============================================================================
+class StateManager:
+    """
+    Manages application state and data loading.
+
+    Provides methods for state transitions, data refresh,
+    and coordinating between views.
+    """
+
+    def __init__(self, vimban_config: Config, tui_config: TUIConfig):
+        self.vimban_config: Config = vimban_config
+        self.tui_config: TUIConfig = tui_config
+        self.state: AppState = AppState(
+            current_view=tui_config.default_view,
+            current_layout=tui_config.default_layout,
+            render_markdown=tui_config.split_render_markdown,
+        )
+        self._load_data()
+
+    def _load_data(self) -> None:
+        """Load tickets and people from filesystem."""
+        # Build filter dict
+        filters: dict[str, Any] = {}
+
+        # Handle done_last_days filtering
+        # None = exclude done and cancelled
+        # 0 = show all done
+        # N > 0 = show done from last N days
+        if self.tui_config.done_last_days is None:
+            # Exclude done and cancelled by filtering for active statuses
+            active_statuses: list[str] = [
+                s for s in STATUSES if s not in ['done', 'cancelled']
+            ]
+            filters['status'] = ','.join(active_statuses)
+        else:
+            # Include done but exclude cancelled
+            active_statuses: list[str] = [
+                s for s in STATUSES if s != 'cancelled'
+            ]
+            filters['status'] = ','.join(active_statuses)
+
+        if self.state.status_filter:
+            filters['status'] = ','.join(self.state.status_filter)
+
+        if self.state.type_filter:
+            filters['type'] = ','.join(self.state.type_filter)
+
+        # Load tickets
+        self.state.tickets = fallback_list_tickets(
+            self.vimban_config.directory,
+            filters,
+            exclude_types=['person'],
+            include_archived=self.tui_config.include_archived
+        )
+
+        # Filter done tickets by end_date if done_last_days > 0
+        # Falls back to updated date if end_date is missing, and fixes the frontmatter
+        if self.tui_config.done_last_days is not None and self.tui_config.done_last_days > 0:
+            cutoff_date: date = date.today() - timedelta(days=self.tui_config.done_last_days)
+            filtered_tickets: list[Ticket] = []
+            for t in self.state.tickets:
+                if t.status != 'done':
+                    filtered_tickets.append(t)
+                elif t.end_date and t.end_date >= cutoff_date:
+                    filtered_tickets.append(t)
+                elif t.end_date is None and t.updated and t.updated.date() >= cutoff_date:
+                    # Fix frontmatter: set end_date from updated date
+                    self._fix_missing_end_date(t)
+                    filtered_tickets.append(t)
+            self.state.tickets = filtered_tickets
+
+        # Filter by scope if specified
+        if self.tui_config.scope:
+            self.state.tickets = [
+                t for t in self.state.tickets
+                if detect_scope_from_path(
+                    t.filepath,
+                    self.vimban_config.directory
+                ) == self.tui_config.scope
+            ]
+
+        # Sort tickets by due date (None at end)
+        self.state.tickets.sort(
+            key=lambda t: (t.due_date is None, t.due_date)
+        )
+
+        # Build kanban board
+        self._build_kanban_board()
+
+        # Load people
+        self._load_people()
+
+        # Load mentorship meetings
+        self._load_mentorship_meetings()
+
+    def _build_kanban_board(self) -> None:
+        """Organize tickets into kanban columns by status."""
+        self.state.kanban_board = {status: [] for status in STATUSES}
+        for ticket in self.state.tickets:
+            if ticket.status in self.state.kanban_board:
+                self.state.kanban_board[ticket.status].append(ticket)
+
+    def _load_people(self) -> None:
+        """Load all people from the people directory."""
+        self.state.people = []
+
+        # Determine which people directories to scan based on scope
+        base_dir: Path = self.vimban_config.directory / "02_areas"
+        people_dirs: list[Path]
+        if self.tui_config.scope == 'work':
+            people_dirs = [base_dir / "work" / "people"]
+        elif self.tui_config.scope == 'personal':
+            people_dirs = [base_dir / "personal" / "people"]
+        else:
+            # Default: scan both work and personal people
+            people_dirs = [
+                base_dir / "work" / "people",
+                base_dir / "personal" / "people"
+            ]
+
+        for people_dir in people_dirs:
+            if not people_dir.exists():
+                continue
+            for md_file in people_dir.rglob('*.md'):
+                try:
+                    person: Person = Person.from_file(md_file)
+                    self.state.people.append(person)
+                except (ValueError, yaml.YAMLError):
+                    continue
+
+        # Sort by name
+        self.state.people.sort(key=lambda p: p.name.lower())
+
+    def _load_mentorship_meetings(self) -> None:
+        """Load all mentorship meetings from the mentorship directory."""
+        self.state.mentorship_meetings = []
+
+        # Skip loading if personal scope (mentorship is work-only)
+        if self.tui_config.scope == 'personal':
+            return
+
+        mentorship_dir: Path = (
+            self.vimban_config.directory / "02_areas" / "work" / "mentorship"
+        )
+
+        if not mentorship_dir.exists():
+            return
+
+        for md_file in sorted(mentorship_dir.glob('**/*.md'), reverse=True):
+            try:
+                ticket: Ticket = Ticket.from_file(md_file)
+                if ticket.type == 'mentorship':
+                    self.state.mentorship_meetings.append(ticket)
+            except (ValueError, yaml.YAMLError):
+                continue
+
+        # Sort by created date (newest first)
+        self.state.mentorship_meetings.sort(
+            key=lambda t: t.created or datetime.min, reverse=True
+        )
+
+    def refresh_data(self) -> None:
+        """Reload all data from filesystem."""
+        self._load_data()
+        self.clamp_selection()
+
+    def _fix_missing_end_date(self, ticket: Ticket) -> None:
+        """
+        Fix a done ticket that's missing end_date by using updated date.
+
+        Updates both the file frontmatter and the in-memory ticket object.
+        """
+        if ticket.filepath and ticket.updated:
+            content: str = ticket.filepath.read_text()
+            metadata, body = parse_frontmatter(content)
+            metadata['end_date'] = ticket.updated.date().isoformat()
+            ticket.filepath.write_text(dump_frontmatter(metadata, body))
+            ticket.end_date = ticket.updated.date()
+
+    def switch_view(self, direction: int = 1) -> None:
+        """
+        Cycle through views.
+
+        Args:
+            direction: 1 for next view, -1 for previous view
+        """
+        views: list[ViewType] = list(ViewType)
+        current_idx: int = views.index(self.state.current_view)
+        new_idx: int = (current_idx + direction) % len(views)
+        self.state.current_view = views[new_idx]
+        self.state.selected_row = 0
+        self.state.selected_col = 0
+        self.state.scroll_offset = 0
+        self.state.detail_scroll = 0
+
+    def switch_layout(self) -> None:
+        """Cycle through layouts: kanban -> list -> split -> kanban."""
+        layouts: list[LayoutType] = [
+            LayoutType.KANBAN, LayoutType.LIST, LayoutType.SPLIT
+        ]
+        current_idx: int = layouts.index(self.state.current_layout)
+        self.state.current_layout = layouts[(current_idx + 1) % len(layouts)]
+        self.clamp_selection()
+
+    def move_selection(
+        self,
+        delta_row: int = 0,
+        delta_col: int = 0,
+        absolute_row: Optional[int] = None,
+        absolute_col: Optional[int] = None
+    ) -> None:
+        """
+        Move selection by delta or to absolute position.
+
+        Handles different layouts appropriately.
+        """
+        if absolute_row is not None:
+            self.state.selected_row = absolute_row
+        else:
+            self.state.selected_row += delta_row
+
+        if absolute_col is not None:
+            self.state.selected_col = absolute_col
+        else:
+            self.state.selected_col += delta_col
+
+        self.clamp_selection()
+
+    def clamp_selection(self) -> None:
+        """Clamp selection to valid range based on current view/layout."""
+        if self.state.current_view == ViewType.PEOPLE:
+            max_row: int = max(0, len(self.state.people) - 1)
+            self.state.selected_row = max(0, min(self.state.selected_row, max_row))
+            self.state.selected_col = 0
+        elif self.state.current_view == ViewType.MENTORSHIP:
+            max_row: int = max(0, len(self.state.mentorship_meetings) - 1)
+            self.state.selected_row = max(0, min(self.state.selected_row, max_row))
+            self.state.selected_col = 0
+        elif self.state.current_layout == LayoutType.KANBAN:
+            # Clamp column to visible columns
+            columns: list[str] = self.tui_config.get_kanban_columns()
+            max_col: int = max(0, len(columns) - 1)
+            self.state.selected_col = max(0, min(self.state.selected_col, max_col))
+
+            # Clamp row to items in current column
+            if columns:
+                current_status: str = columns[self.state.selected_col]
+                items: list[Ticket] = self.state.kanban_board.get(current_status, [])
+                max_row = max(0, len(items) - 1)
+                self.state.selected_row = max(0, min(self.state.selected_row, max_row))
+
+            # Adjust scroll offset to keep selected row visible
+            self._adjust_kanban_scroll()
+        else:
+            # List or Split layout
+            max_row = max(0, len(self.state.tickets) - 1)
+            self.state.selected_row = max(0, min(self.state.selected_row, max_row))
+            self.state.selected_col = 0
+
+    def _adjust_kanban_scroll(self) -> None:
+        """
+        Adjust the kanban scroll offset for the current column to keep
+        the selected row visible within the viewport.
+        """
+        col_idx: int = self.state.selected_col
+        selected_row: int = self.state.selected_row
+        cards_per_col: int = self.state.kanban_cards_per_col
+
+        # If cards_per_col is 0, rendering hasn't happened yet - skip adjustment
+        if cards_per_col <= 0:
+            return
+
+        # Get current scroll offset for this column
+        current_scroll: int = self.state.kanban_scroll_offsets.get(col_idx, 0)
+
+        # Check if selected row is above visible area
+        if selected_row < current_scroll:
+            self.state.kanban_scroll_offsets[col_idx] = selected_row
+
+        # Check if selected row is below visible area
+        elif selected_row >= current_scroll + cards_per_col:
+            self.state.kanban_scroll_offsets[col_idx] = selected_row - cards_per_col + 1
+
+    def get_selected_item(self) -> Optional[Ticket | Person]:
+        """Get the currently selected item (ticket or person)."""
+        if self.state.current_view == ViewType.PEOPLE:
+            if 0 <= self.state.selected_row < len(self.state.people):
+                return self.state.people[self.state.selected_row]
+            return None
+
+        if self.state.current_view == ViewType.MENTORSHIP:
+            if 0 <= self.state.selected_row < len(self.state.mentorship_meetings):
+                return self.state.mentorship_meetings[self.state.selected_row]
+            return None
+
+        if self.state.current_layout == LayoutType.KANBAN:
+            columns: list[str] = self.tui_config.get_kanban_columns()
+            if not columns:
+                return None
+            current_status: str = columns[self.state.selected_col]
+            items: list[Ticket] = self.state.kanban_board.get(current_status, [])
+            if 0 <= self.state.selected_row < len(items):
+                return items[self.state.selected_row]
+            return None
+
+        # List or Split layout
+        if 0 <= self.state.selected_row < len(self.state.tickets):
+            return self.state.tickets[self.state.selected_row]
+        return None
+
+    def set_status(self, message: str, is_error: bool = False) -> None:
+        """Set status bar message."""
+        self.state.status_message = message
+        self.state.status_is_error = is_error
+
+
+# ============================================================================
+# DIALOG MANAGER
+# ============================================================================
+class DialogManager:
+    """
+    Manages modal dialogs for user interaction.
+
+    Provides confirmation, selection, and input dialogs
+    that overlay the main TUI.
+    """
+
+    def __init__(self, stdscr: Any):
+        self.stdscr: Any = stdscr
+
+    def confirm(
+        self,
+        title: str,
+        message: str,
+        item_title: str = ""
+    ) -> bool:
+        """
+        Show a confirmation dialog.
+
+        Returns True if user confirms, False otherwise.
+        """
+        height, width = self.stdscr.getmaxyx()
+
+        # Calculate dialog dimensions
+        dialog_width: int = min(50, width - 4)
+        dialog_height: int = 9 if item_title else 7
+        start_y: int = (height - dialog_height) // 2
+        start_x: int = (width - dialog_width) // 2
+
+        # Create dialog window
+        dialog: Any = curses.newwin(dialog_height, dialog_width, start_y, start_x)
+        dialog.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+        dialog.box()
+        dialog.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+
+        # Draw title
+        dialog.attron(curses.A_BOLD)
+        try:
+            dialog.addstr(1, 2, title[:dialog_width - 4])
+        except curses.error:
+            pass
+        dialog.attroff(curses.A_BOLD)
+
+        # Draw item title if provided
+        row: int = 3
+        if item_title:
+            try:
+                dialog.addstr(row, 2, f'"{item_title[:dialog_width - 6]}"')
+            except curses.error:
+                pass
+            row += 2
+
+        # Draw message
+        try:
+            dialog.addstr(row, 2, message[:dialog_width - 4])
+        except curses.error:
+            pass
+
+        # Draw buttons
+        try:
+            dialog.addstr(row + 2, 2, "[y] Yes    [n] No")
+        except curses.error:
+            pass
+
+        dialog.refresh()
+
+        # Wait for input
+        while True:
+            key: int = self.stdscr.getch()
+            if key == ord('y') or key == ord('Y'):
+                return True
+            elif key == ord('n') or key == ord('N') or key == 27:  # ESC
+                return False
+
+    def select_type(self) -> Optional[str]:
+        """
+        Show a type selection dialog for creating new items.
+
+        Returns the selected type string or None if cancelled.
+        """
+        height, width = self.stdscr.getmaxyx()
+
+        # All available types
+        types: list[str] = list(ALL_TYPES) + ['person']
+
+        dialog_width: int = min(40, width - 4)
+        dialog_height: int = min(len(types) + 6, height - 4)
+        start_y: int = (height - dialog_height) // 2
+        start_x: int = (width - dialog_width) // 2
+
+        dialog: Any = curses.newwin(dialog_height, dialog_width, start_y, start_x)
+        selected: int = 0
+        scroll: int = 0
+        visible_items: int = dialog_height - 6
+
+        while True:
+            dialog.clear()
+            dialog.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            dialog.box()
+            dialog.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+
+            # Title
+            dialog.attron(curses.A_BOLD)
+            try:
+                dialog.addstr(1, 2, "Create New Item")
+            except curses.error:
+                pass
+            dialog.attroff(curses.A_BOLD)
+
+            # List types
+            for i, type_name in enumerate(types[scroll:scroll + visible_items]):
+                actual_idx: int = scroll + i
+                row: int = 3 + i
+
+                if actual_idx == selected:
+                    dialog.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+                    try:
+                        dialog.addstr(row, 2, f"> {type_name:<{dialog_width - 6}}")
+                    except curses.error:
+                        pass
+                    dialog.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+                else:
+                    try:
+                        dialog.addstr(row, 2, f"  {type_name}")
+                    except curses.error:
+                        pass
+
+            # Help text
+            try:
+                dialog.addstr(dialog_height - 2, 2, "j/k:navigate  Enter:select  q:cancel")
+            except curses.error:
+                pass
+
+            dialog.refresh()
+
+            key: int = self.stdscr.getch()
+            if key == ord('q') or key == 27:  # ESC
+                return None
+            elif key == ord('j') or key == curses.KEY_DOWN:
+                if selected < len(types) - 1:
+                    selected += 1
+                    if selected >= scroll + visible_items:
+                        scroll += 1
+            elif key == ord('k') or key == curses.KEY_UP:
+                if selected > 0:
+                    selected -= 1
+                    if selected < scroll:
+                        scroll -= 1
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                return types[selected]
+
+    def text_input(self, prompt: str, initial: str = "") -> Optional[str]:
+        """
+        Show a text input dialog.
+
+        Returns the entered text or None if cancelled.
+        """
+        height, width = self.stdscr.getmaxyx()
+
+        dialog_width: int = min(60, width - 4)
+        dialog_height: int = 5
+        start_y: int = (height - dialog_height) // 2
+        start_x: int = (width - dialog_width) // 2
+
+        dialog: Any = curses.newwin(dialog_height, dialog_width, start_y, start_x)
+        curses.curs_set(1)  # Show cursor
+
+        text: str = initial
+        cursor_pos: int = len(text)
+
+        while True:
+            dialog.clear()
+            dialog.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            dialog.box()
+            dialog.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+
+            try:
+                dialog.addstr(1, 2, prompt[:dialog_width - 4])
+            except curses.error:
+                pass
+
+            # Show input field
+            input_width: int = dialog_width - 6
+            visible_text: str = text[-input_width:] if len(text) > input_width else text
+            try:
+                dialog.addstr(2, 2, visible_text)
+                dialog.move(2, 2 + min(cursor_pos, input_width))
+            except curses.error:
+                pass
+
+            dialog.refresh()
+
+            key: int = self.stdscr.getch()
+            if key == 27:  # ESC
+                curses.curs_set(0)
+                return None
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                curses.curs_set(0)
+                return text if text else None
+            elif key == curses.KEY_BACKSPACE or key == 127:
+                if cursor_pos > 0:
+                    text = text[:cursor_pos - 1] + text[cursor_pos:]
+                    cursor_pos -= 1
+            elif key == curses.KEY_DC:  # Delete
+                if cursor_pos < len(text):
+                    text = text[:cursor_pos] + text[cursor_pos + 1:]
+            elif key == curses.KEY_LEFT:
+                cursor_pos = max(0, cursor_pos - 1)
+            elif key == curses.KEY_RIGHT:
+                cursor_pos = min(len(text), cursor_pos + 1)
+            elif key == curses.KEY_HOME:
+                cursor_pos = 0
+            elif key == curses.KEY_END:
+                cursor_pos = len(text)
+            elif 32 <= key <= 126:  # Printable ASCII
+                text = text[:cursor_pos] + chr(key) + text[cursor_pos:]
+                cursor_pos += 1
+
+    def select_status(self, current: str = "") -> Optional[str]:
+        """
+        Show a status selection dialog.
+
+        Returns selected status or None if cancelled.
+        """
+        return self._select_from_list("Move to Status", STATUSES, current)
+
+    def select_priority(self, current: str = "") -> Optional[str]:
+        """
+        Show a priority selection dialog.
+
+        Returns selected priority or None if cancelled.
+        """
+        return self._select_from_list("Set Priority", PRIORITIES, current)
+
+    def select_edit_field(self) -> Optional[str]:
+        """
+        Show field selection for metadata editing.
+
+        Returns selected field name or None if cancelled.
+        """
+        fields: list[str] = [
+            "assignee",
+            "status",
+            "priority",
+            "add-tag",
+            "remove-tag",
+            "progress",
+            "due",
+            "clear",
+            "link",
+            "unlink",
+        ]
+        return self._select_from_list("Edit Field", fields)
+
+    def select_clear_field(self) -> Optional[str]:
+        """
+        Show clearable fields selection.
+
+        Returns selected field name or None if cancelled.
+        """
+        fields: list[str] = ["assignee", "due_date", "progress", "effort"]
+        return self._select_from_list("Clear Field", fields)
+
+    def select_link_relation(self) -> Optional[str]:
+        """
+        Show link relation type selection.
+
+        Returns selected relation type or None if cancelled.
+        """
+        relations: list[str] = ["member_of", "blocked_by", "blocks", "relates_to"]
+        return self._select_from_list("Link Relation", relations)
+
+    def select_tag(self, tags: list[str]) -> Optional[str]:
+        """
+        Select a tag from the provided list.
+
+        Args:
+            tags: List of tags to choose from
+
+        Returns:
+            Selected tag or None if cancelled or no tags provided.
+        """
+        if not tags:
+            return None
+        return self._select_from_list("Remove Tag", tags)
+
+    def select_comment(self, item_ref: str, directory: Path) -> Optional[int]:
+        """
+        Show a comment selection dialog for replying.
+
+        Fetches comments from vimban and displays them for selection.
+
+        Args:
+            item_ref: Ticket ID or person reference
+            directory: Vimban directory path
+
+        Returns:
+            Comment number to reply to, or None if cancelled/no comments.
+        """
+        # Fetch comments using vimban CLI
+        cmd: list[str] = [
+            'vimban', '--no-color', '--directory', str(directory),
+            'comment', item_ref, '--print', 'all'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return None
+
+        # Parse comments from output
+        # Format: "#N (timestamp)" on one line, comment text on next line
+        comments: list[tuple[int, str]] = []
+        lines: list[str] = result.stdout.strip().split('\n')
+        i: int = 0
+        while i < len(lines):
+            line: str = lines[i].strip()
+            # Match lines like "#1 (2025-12-22 13:19)" or just "#1"
+            match = re.match(r'^#(\d+)', line)
+            if match:
+                num: int = int(match.group(1))
+                # Next line is the comment text
+                text: str = ""
+                if i + 1 < len(lines):
+                    text = lines[i + 1].strip()
+                comments.append((num, text))
+                i += 2  # Skip the text line
+            else:
+                i += 1
+
+        if not comments:
+            return None
+
+        # Build display items
+        display_items: list[str] = []
+        for num, text in comments:
+            preview: str = text[:40] + "..." if len(text) > 40 else text
+            display_items.append(f"#{num}: {preview}")
+
+        # Show selection dialog
+        height, width = self.stdscr.getmaxyx()
+
+        dialog_width: int = min(60, width - 4)
+        dialog_height: int = min(len(display_items) + 5, height - 4)
+        start_y: int = (height - dialog_height) // 2
+        start_x: int = (width - dialog_width) // 2
+
+        dialog: Any = curses.newwin(dialog_height, dialog_width, start_y, start_x)
+        selected: int = 0
+        scroll: int = 0
+        visible_items: int = dialog_height - 5
+
+        while True:
+            dialog.clear()
+            dialog.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            dialog.box()
+            dialog.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+
+            # Title
+            dialog.attron(curses.A_BOLD)
+            try:
+                dialog.addstr(1, 2, "Reply to Comment")
+            except curses.error:
+                pass
+            dialog.attroff(curses.A_BOLD)
+
+            # List comments
+            for i, item in enumerate(display_items[scroll:scroll + visible_items]):
+                actual_idx: int = scroll + i
+                row: int = 3 + i
+
+                if actual_idx == selected:
+                    dialog.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+                    try:
+                        dialog.addstr(row, 2, f"> {item:<{dialog_width - 6}}"[:dialog_width - 4])
+                    except curses.error:
+                        pass
+                    dialog.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+                else:
+                    try:
+                        dialog.addstr(row, 2, f"  {item}"[:dialog_width - 4])
+                    except curses.error:
+                        pass
+
+            # Help text
+            try:
+                dialog.addstr(dialog_height - 2, 2, "j/k:navigate  Enter:select  q:cancel")
+            except curses.error:
+                pass
+
+            dialog.refresh()
+
+            key: int = self.stdscr.getch()
+            if key == ord('q') or key == 27:  # ESC
+                return None
+            elif key == ord('j') or key == curses.KEY_DOWN:
+                if selected < len(display_items) - 1:
+                    selected += 1
+                    if selected >= scroll + visible_items:
+                        scroll += 1
+            elif key == ord('k') or key == curses.KEY_UP:
+                if selected > 0:
+                    selected -= 1
+                    if selected < scroll:
+                        scroll -= 1
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                return comments[selected][0]
+
+    def _select_from_list(
+        self,
+        title: str,
+        items: list[str],
+        current: str = ""
+    ) -> Optional[str]:
+        """Generic list selection dialog."""
+        height, width = self.stdscr.getmaxyx()
+
+        dialog_width: int = min(35, width - 4)
+        dialog_height: int = len(items) + 5
+        start_y: int = (height - dialog_height) // 2
+        start_x: int = (width - dialog_width) // 2
+
+        dialog: Any = curses.newwin(dialog_height, dialog_width, start_y, start_x)
+
+        # Find current index
+        selected: int = 0
+        if current in items:
+            selected = items.index(current)
+
+        while True:
+            dialog.clear()
+            dialog.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            dialog.box()
+            dialog.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+
+            dialog.attron(curses.A_BOLD)
+            try:
+                dialog.addstr(1, 2, title)
+            except curses.error:
+                pass
+            dialog.attroff(curses.A_BOLD)
+
+            for i, item in enumerate(items):
+                row: int = 3 + i
+                if i == selected:
+                    dialog.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+                    try:
+                        dialog.addstr(row, 2, f"> {item:<{dialog_width - 6}}")
+                    except curses.error:
+                        pass
+                    dialog.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+                else:
+                    marker: str = "*" if item == current else " "
+                    try:
+                        dialog.addstr(row, 2, f"{marker} {item}")
+                    except curses.error:
+                        pass
+
+            dialog.refresh()
+
+            key: int = self.stdscr.getch()
+            if key == ord('q') or key == 27:
+                return None
+            elif key == ord('j') or key == curses.KEY_DOWN:
+                selected = min(selected + 1, len(items) - 1)
+            elif key == ord('k') or key == curses.KEY_UP:
+                selected = max(selected - 1, 0)
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                return items[selected]
+
+    def show_info(self, title: str, info_lines: list[str]) -> None:
+        """
+        Show an info dialog with scrollable content.
+
+        Displays metadata in a centered dialog. Press q/Esc/Enter to close.
+        Use j/k to scroll if content exceeds dialog height.
+
+        Args:
+            title: Dialog title displayed at top
+            info_lines: List of strings to display (one per line)
+        """
+        height, width = self.stdscr.getmaxyx()
+
+        # Calculate dialog dimensions based on content
+        max_line_len: int = max(len(line) for line in info_lines) if info_lines else 20
+        dialog_width: int = min(max(max_line_len + 6, len(title) + 6, 50), width - 4)
+        # Height: title(1) + blank(1) + content + blank(1) + help(1) + borders(2)
+        content_height: int = min(len(info_lines), height - 10)
+        dialog_height: int = content_height + 6
+        start_y: int = (height - dialog_height) // 2
+        start_x: int = (width - dialog_width) // 2
+
+        dialog: Any = curses.newwin(dialog_height, dialog_width, start_y, start_x)
+        scroll: int = 0
+        visible_lines: int = content_height
+
+        while True:
+            dialog.clear()
+            dialog.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            dialog.box()
+            dialog.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+
+            # Draw title
+            dialog.attron(curses.A_BOLD)
+            try:
+                dialog.addstr(1, 2, title[:dialog_width - 4])
+            except curses.error:
+                pass
+            dialog.attroff(curses.A_BOLD)
+
+            # Draw info lines with scrolling
+            for i, line in enumerate(info_lines[scroll:scroll + visible_lines]):
+                row: int = 3 + i
+                # Truncate line if too long
+                display_line: str = line[:dialog_width - 4]
+                try:
+                    # Highlight field names (text before colon)
+                    if ':' in display_line:
+                        colon_pos: int = display_line.index(':')
+                        field_name: str = display_line[:colon_pos + 1]
+                        field_value: str = display_line[colon_pos + 1:]
+                        dialog.attron(curses.color_pair(ThemeManager.PAIR_HEADER))
+                        dialog.addstr(row, 2, field_name)
+                        dialog.attroff(curses.color_pair(ThemeManager.PAIR_HEADER))
+                        dialog.addstr(row, 2 + len(field_name), field_value)
+                    else:
+                        dialog.addstr(row, 2, display_line)
+                except curses.error:
+                    pass
+
+            # Draw scroll indicator if needed
+            if len(info_lines) > visible_lines:
+                indicator: str = f"[{scroll + 1}-{min(scroll + visible_lines, len(info_lines))}/{len(info_lines)}]"
+                try:
+                    dialog.addstr(1, dialog_width - len(indicator) - 2, indicator)
+                except curses.error:
+                    pass
+
+            # Draw help text
+            help_text: str = "j/k:scroll  q/Enter:close" if len(info_lines) > visible_lines else "q/Enter:close"
+            try:
+                dialog.addstr(dialog_height - 2, 2, help_text)
+            except curses.error:
+                pass
+
+            dialog.refresh()
+
+            # Wait for input
+            key: int = self.stdscr.getch()
+            if key == ord('q') or key == 27 or key == ord('\n') or key == curses.KEY_ENTER:
+                return
+            elif key == ord('j') or key == curses.KEY_DOWN:
+                if scroll < len(info_lines) - visible_lines:
+                    scroll += 1
+            elif key == ord('k') or key == curses.KEY_UP:
+                if scroll > 0:
+                    scroll -= 1
+            elif key == 4:  # Ctrl+d
+                scroll = min(scroll + visible_lines // 2, max(0, len(info_lines) - visible_lines))
+            elif key == 21:  # Ctrl+u
+                scroll = max(scroll - visible_lines // 2, 0)
+            elif key == ord('g'):
+                scroll = 0
+            elif key == ord('G'):
+                scroll = max(0, len(info_lines) - visible_lines)
+
+
+# ============================================================================
+# LAYOUT RENDERERS
+# ============================================================================
+class ListRenderer:
+    """
+    Renders ticket list in a table format.
+
+    Shows columns like ID, status, priority, assignee, title, due date.
+    """
+
+    def __init__(self, stdscr: Any, state: AppState, config: TUIConfig):
+        self.stdscr: Any = stdscr
+        self.state: AppState = state
+        self.config: TUIConfig = config
+
+    def render(self, start_y: int, start_x: int, height: int, width: int) -> None:
+        """Render the list view within the given bounds."""
+        tickets: list[Ticket] = self.state.tickets
+
+        # Column widths (fixed columns)
+        base_widths: dict[str, int] = {
+            "id": 12,
+            "status": 12,
+            "priority": 10,
+            "assignee": 15,
+            "due_date": 12,
+        }
+
+        # Calculate available width for title based on displayed columns
+        fixed_width: int = sum(
+            base_widths.get(col, 10) + 1  # +1 for column spacer
+            for col in self.config.list_columns if col != "title"
+        )
+        title_width: int = max(20, width - fixed_width - 1)
+
+        col_widths: dict[str, int] = {**base_widths, "title": title_width}
+
+        # Header row
+        header_y: int = start_y
+        x: int = start_x
+        for col_name in self.config.list_columns:
+            col_width: int = col_widths.get(col_name, 10)
+            try:
+                self.stdscr.attron(curses.A_BOLD)
+                self.stdscr.addstr(
+                    header_y, x,
+                    col_name.upper().replace('_', ' ')[:col_width].ljust(col_width)
+                )
+                self.stdscr.attroff(curses.A_BOLD)
+            except curses.error:
+                pass
+            x += col_width + 1
+
+        # Separator
+        try:
+            self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            self.stdscr.addstr(header_y + 1, start_x, "-" * (width - 1))
+            self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+        except curses.error:
+            pass
+
+        # Data rows
+        visible_rows: int = height - 3
+        for i, ticket in enumerate(tickets[self.state.scroll_offset:]):
+            if i >= visible_rows:
+                break
+
+            row_y: int = start_y + 2 + i
+            actual_idx: int = self.state.scroll_offset + i
+            is_selected: bool = actual_idx == self.state.selected_row
+
+            if is_selected:
+                self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+            x = start_x
+            for col_name in self.config.list_columns:
+                col_width = col_widths.get(col_name, 10)
+                value: str = self._get_column_value(ticket, col_name)
+
+                # Apply color for status/priority/assignee
+                if not is_selected:
+                    if col_name == "status":
+                        pair: int = ThemeManager.get_status_pair(ticket.status)
+                        self.stdscr.attron(curses.color_pair(pair))
+                    elif col_name == "priority":
+                        pair = ThemeManager.get_priority_pair(ticket.priority)
+                        self.stdscr.attron(curses.color_pair(pair))
+                    elif col_name == "assignee" and ticket.assignee:
+                        assignee_name: str = Path(ticket.assignee.path).stem
+                        pair = ThemeManager.get_assignee_pair(assignee_name)
+                        self.stdscr.attron(curses.color_pair(pair))
+
+                try:
+                    self.stdscr.addstr(row_y, x, value[:col_width].ljust(col_width))
+                except curses.error:
+                    pass
+
+                if not is_selected:
+                    if col_name in ("status", "priority"):
+                        self.stdscr.attroff(curses.color_pair(pair))
+                    elif col_name == "assignee" and ticket.assignee:
+                        self.stdscr.attroff(curses.color_pair(pair))
+
+                x += col_width + 1
+
+            if is_selected:
+                self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+    def _get_column_value(self, ticket: Ticket, col_name: str) -> str:
+        """Get formatted value for a column."""
+        if col_name == "id":
+            return ticket.id
+        elif col_name == "status":
+            return ticket.status
+        elif col_name == "priority":
+            return ticket.priority
+        elif col_name == "assignee":
+            if ticket.assignee:
+                # Extract name from transclusion link
+                path: str = ticket.assignee.path
+                return Path(path).stem.replace('_', ' ')
+            return ""
+        elif col_name == "title":
+            return ticket.title
+        elif col_name == "due_date":
+            if ticket.due_date:
+                return str(ticket.due_date)
+            return ""
+        return ""
+
+
+class KanbanRenderer:
+    """
+    Renders tickets in a kanban board layout.
+
+    Shows columns for each status with tickets as cards.
+    """
+
+    def __init__(self, stdscr: Any, state: AppState, config: TUIConfig):
+        self.stdscr: Any = stdscr
+        self.state: AppState = state
+        self.config: TUIConfig = config
+
+    def render(self, start_y: int, start_x: int, height: int, width: int) -> None:
+        """Render the kanban board within the given bounds."""
+        columns: list[str] = self.config.get_kanban_columns()
+        if not columns:
+            return
+
+        col_width: int = (width - 1) // len(columns)
+
+        # Draw column headers
+        for i, status in enumerate(columns):
+            col_x: int = start_x + (i * col_width)
+            count: int = len(self.state.kanban_board.get(status, []))
+
+            header: str = f"{status.upper()} ({count})"
+            pair: int = ThemeManager.get_status_pair(status)
+
+            try:
+                self.stdscr.attron(curses.color_pair(pair) | curses.A_BOLD)
+                self.stdscr.addstr(start_y, col_x, header[:col_width - 1])
+                self.stdscr.attroff(curses.color_pair(pair) | curses.A_BOLD)
+            except curses.error:
+                pass
+
+        # Draw column separators and cards
+        card_height: int = 3 if self.config.kanban_compact else 4
+        cards_per_col: int = (height - 2) // card_height
+
+        # Store cards_per_col on state for scroll adjustment calculations
+        self.state.kanban_cards_per_col = cards_per_col
+
+        for col_idx, status in enumerate(columns):
+            col_x: int = start_x + (col_idx * col_width)
+            tickets: list[Ticket] = self.state.kanban_board.get(status, [])
+
+            # Draw vertical separator
+            try:
+                self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+                for y in range(start_y + 1, start_y + height):
+                    self.stdscr.addch(y, col_x + col_width - 1, curses.ACS_VLINE)
+                self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+            except curses.error:
+                pass
+
+            # Draw cards with scroll offset
+            col_scroll: int = self.state.kanban_scroll_offsets.get(col_idx, 0)
+            visible_tickets: list[Ticket] = tickets[col_scroll:col_scroll + cards_per_col]
+
+            for display_idx, ticket in enumerate(visible_tickets):
+                card_y: int = start_y + 1 + (display_idx * card_height)
+                actual_idx: int = col_scroll + display_idx
+                is_selected: bool = (
+                    col_idx == self.state.selected_col and
+                    actual_idx == self.state.selected_row
+                )
+
+                self._draw_card(
+                    ticket, col_x, card_y,
+                    col_width - 2, card_height,
+                    is_selected
+                )
+
+            # Draw scroll indicator if there are more tickets above or below
+            total_tickets: int = len(tickets)
+            if total_tickets > cards_per_col:
+                indicator: str = f"[{col_scroll + 1}-{min(col_scroll + cards_per_col, total_tickets)}/{total_tickets}]"
+                indicator_y: int = start_y + height - 1
+                try:
+                    self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_HELP))
+                    self.stdscr.addstr(indicator_y, col_x, indicator[:col_width - 2])
+                    self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_HELP))
+                except curses.error:
+                    pass
+
+    def _draw_card(
+        self,
+        ticket: Ticket,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        selected: bool
+    ) -> None:
+        """Draw a single ticket card."""
+        if selected:
+            self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+        # Line 1: ID and selection marker
+        marker: str = ">" if selected else " "
+        try:
+            self.stdscr.addstr(y, x, f"{marker}{ticket.id[:width - 1]}")
+        except curses.error:
+            pass
+
+        # Line 2: Title (truncated)
+        try:
+            self.stdscr.addstr(y + 1, x, f" {ticket.title[:width - 2]}")
+        except curses.error:
+            pass
+
+        # Line 3: Priority and assignee (if not compact)
+        if height >= 4:
+            priority_short: str = ticket.priority[:4]
+            priority_text: str = f" [{priority_short}]"
+            assignee_str: str = ""
+            assignee_name: str = ""
+            if ticket.assignee:
+                assignee_name = Path(ticket.assignee.path).stem
+                assignee_str = f" @{assignee_name}"[:width - len(priority_text) - 1]
+
+            # Draw priority with priority color
+            if not selected:
+                pair: int = ThemeManager.get_priority_pair(ticket.priority)
+                self.stdscr.attron(curses.color_pair(pair))
+
+            try:
+                self.stdscr.addstr(y + 2, x, priority_text)
+            except curses.error:
+                pass
+
+            if not selected:
+                self.stdscr.attroff(curses.color_pair(pair))
+
+            # Draw assignee with assignee-specific color
+            if assignee_str:
+                if not selected:
+                    assignee_pair: int = ThemeManager.get_assignee_pair(assignee_name)
+                    self.stdscr.attron(curses.color_pair(assignee_pair))
+
+                try:
+                    self.stdscr.addstr(y + 2, x + len(priority_text), assignee_str)
+                except curses.error:
+                    pass
+
+                if not selected:
+                    self.stdscr.attroff(curses.color_pair(assignee_pair))
+
+        if selected:
+            self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+
+class SplitRenderer:
+    """
+    Renders a split view with list on left and detail on right.
+
+    Detail pane shows full ticket information including body content.
+    """
+
+    def __init__(self, stdscr: Any, state: AppState, config: TUIConfig,
+                 md_renderer: MarkdownRenderer):
+        self.stdscr: Any = stdscr
+        self.state: AppState = state
+        self.config: TUIConfig = config
+        self.md_renderer: MarkdownRenderer = md_renderer
+        self.list_renderer: ListRenderer = ListRenderer(stdscr, state, config)
+
+    def render(self, start_y: int, start_x: int, height: int, width: int) -> None:
+        """Render the split view within the given bounds."""
+        ratio: tuple[int, int] = self.config.split_ratio
+        list_width: int = (width * ratio[0]) // (ratio[0] + ratio[1])
+        detail_width: int = width - list_width - 1
+
+        # Draw list on left
+        self.list_renderer.render(start_y, start_x, height, list_width)
+
+        # Draw vertical separator
+        sep_x: int = start_x + list_width
+        try:
+            self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            for y in range(start_y, start_y + height):
+                self.stdscr.addch(y, sep_x, curses.ACS_VLINE)
+            self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+        except curses.error:
+            pass
+
+        # Draw detail on right
+        detail_x: int = sep_x + 1
+        self._render_detail(start_y, detail_x, height, detail_width)
+
+    def _render_detail(
+        self,
+        start_y: int,
+        start_x: int,
+        height: int,
+        width: int
+    ) -> None:
+        """Render the detail pane for the selected ticket."""
+        tickets: list[Ticket] = self.state.tickets
+        if not tickets or self.state.selected_row >= len(tickets):
+            return
+
+        ticket: Ticket = tickets[self.state.selected_row]
+
+        # Use styled segments: each line is list of (text, attr) tuples
+        lines: list[list[tuple[str, int]]] = []
+
+        # Header with styling
+        heading_attr: int = curses.A_BOLD | curses.color_pair(
+            ThemeManager.PAIR_MD_HEADING
+        )
+        lines.append([(ticket.id, heading_attr)])
+        lines.append([(ticket.title, curses.A_BOLD)])
+        lines.append([("-" * (width - 2), curses.color_pair(ThemeManager.PAIR_BORDER))])
+
+        # Metadata (plain text)
+        lines.append([(f"Status: {ticket.status:<15} Priority: {ticket.priority}", 0)])
+        if ticket.assignee:
+            assignee_name: str = Path(ticket.assignee.path).stem.replace('_', ' ')
+            lines.append([(f"Assignee: {assignee_name}", 0)])
+        if ticket.due_date:
+            lines.append([(f"Due: {ticket.due_date}", 0)])
+        if ticket.tags:
+            lines.append([(f"Tags: {', '.join(ticket.tags)}", 0)])
+
+        lines.append([("-" * (width - 2), curses.color_pair(ThemeManager.PAIR_BORDER))])
+
+        # Body content
+        if self.config.split_show_body:
+            try:
+                content: str = ticket.filepath.read_text()
+                _, body = parse_frontmatter(content)
+
+                # Render with markdown styling if enabled
+                if self.state.render_markdown and HAS_MISTUNE:
+                    styled_lines = self.md_renderer.render(body, width - 2)
+                    lines.extend(styled_lines)
+                else:
+                    # Raw markdown - wrap as single-segment lines
+                    for line in body.split('\n'):
+                        while len(line) > width - 2:
+                            lines.append([(line[:width - 2], 0)])
+                            line = line[width - 2:]
+                        lines.append([(line, 0)])
+            except (OSError, ValueError):
+                lines.append([("[Could not read file]", curses.color_pair(
+                    ThemeManager.PAIR_ERROR
+                ))])
+
+        # Render lines with scrolling and styled segments
+        for i, line_segments in enumerate(lines[self.state.detail_scroll:]):
+            if i >= height:
+                break
+            x_pos: int = start_x
+            for text, attr in line_segments:
+                # Truncate if exceeds width
+                max_len: int = start_x + width - 1 - x_pos
+                if len(text) > max_len:
+                    text = text[:max_len]
+                try:
+                    self.stdscr.addstr(start_y + i, x_pos, text, attr)
+                    x_pos += len(text)
+                except curses.error:
+                    pass
+
+class PeopleRenderer:
+    """Renders the people list view."""
+
+    def __init__(self, stdscr: Any, state: AppState, config: TUIConfig):
+        self.stdscr: Any = stdscr
+        self.state: AppState = state
+        self.config: TUIConfig = config
+
+    def render(self, start_y: int, start_x: int, height: int, width: int) -> None:
+        """Render the people list within the given bounds."""
+        people: list[Person] = self.state.people
+
+        # Column widths
+        name_w: int = 20
+        role_w: int = 20
+        team_w: int = 15
+        email_w: int = max(20, width - name_w - role_w - team_w - 6)
+
+        # Header
+        try:
+            self.stdscr.attron(curses.A_BOLD)
+            header: str = (
+                f"{'NAME':<{name_w}} {'ROLE':<{role_w}} "
+                f"{'TEAM':<{team_w}} {'EMAIL':<{email_w}}"
+            )
+            self.stdscr.addstr(start_y, start_x, header[:width - 1])
+            self.stdscr.attroff(curses.A_BOLD)
+        except curses.error:
+            pass
+
+        # Separator
+        try:
+            self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            self.stdscr.addstr(start_y + 1, start_x, "-" * (width - 1))
+            self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+        except curses.error:
+            pass
+
+        # Data rows
+        visible_rows: int = height - 3
+        for i, person in enumerate(people[self.state.scroll_offset:]):
+            if i >= visible_rows:
+                break
+
+            row_y: int = start_y + 2 + i
+            actual_idx: int = self.state.scroll_offset + i
+            is_selected: bool = actual_idx == self.state.selected_row
+
+            if is_selected:
+                self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+            row: str = (
+                f"{person.name[:name_w]:<{name_w}} "
+                f"{(person.role or '')[:role_w]:<{role_w}} "
+                f"{(person.team or '')[:team_w]:<{team_w}} "
+                f"{(person.email or '')[:email_w]:<{email_w}}"
+            )
+
+            try:
+                self.stdscr.addstr(row_y, start_x, row[:width - 1])
+            except curses.error:
+                pass
+
+            if is_selected:
+                self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+
+class MentorshipRenderer:
+    """
+    Renders mentorship meetings grouped by person (mentee).
+
+    Shows mentor meetings in a grouped list format with person name headers
+    and chronological meeting entries underneath.
+    """
+
+    def __init__(self, stdscr: Any, state: AppState, config: TUIConfig):
+        self.stdscr: Any = stdscr
+        self.state: AppState = state
+        self.config: TUIConfig = config
+
+    def render(self, start_y: int, start_x: int, height: int, width: int) -> None:
+        """
+        Render the mentorship view within the given bounds.
+
+        Groups meetings by person (mentee/assignee) and displays
+        them chronologically within each group.
+        """
+        meetings: list[Ticket] = self.state.mentorship_meetings
+
+        if not meetings:
+            try:
+                self.stdscr.addstr(
+                    start_y + 1, start_x,
+                    "No mentorship meetings found. Press 'M' to create one."[:width - 1]
+                )
+            except curses.error:
+                pass
+            return
+
+        # Group meetings by person (assignee = mentee)
+        grouped: dict[str, list[Ticket]] = {}
+        for meeting in meetings:
+            if meeting.assignee:
+                # Extract person name from transclusion link
+                person_key: str = str(meeting.assignee)
+                if '/' in person_key:
+                    person_key = person_key.split('/')[-1].replace('.md', '').replace(']]', '')
+                person_key = person_key.replace('_', ' ').title()
+                person_key = person_key.replace('![[', '')
+            else:
+                person_key = "Unknown"
+
+            if person_key not in grouped:
+                grouped[person_key] = []
+            grouped[person_key].append(meeting)
+
+        # Sort meetings within each group by date (newest first)
+        for person in grouped:
+            grouped[person].sort(key=lambda t: t.created or datetime.min, reverse=True)
+
+        # Render grouped meetings
+        y: int = start_y
+        visible_rows: int = height - 1
+        row_count: int = 0
+        flat_items: list[tuple[str, Optional[Ticket]]] = []  # For navigation
+
+        # Flatten for rendering with headers
+        for person in sorted(grouped.keys()):
+            flat_items.append((person, None))  # Header
+            for meeting in grouped[person]:
+                flat_items.append((person, meeting))
+
+        # Apply scroll offset
+        start_idx: int = self.state.scroll_offset
+        selected_flat_idx: int = self.state.selected_row
+
+        for idx, (person, meeting) in enumerate(flat_items[start_idx:]):
+            if row_count >= visible_rows:
+                break
+
+            actual_idx: int = start_idx + idx
+            is_selected: bool = actual_idx == selected_flat_idx and meeting is not None
+
+            if meeting is None:
+                # Person header
+                try:
+                    self.stdscr.attron(curses.A_BOLD)
+                    self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_TITLE))
+                    header: str = f"\n{person}"
+                    self.stdscr.addstr(y, start_x, header[:width - 1])
+                    self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_TITLE))
+                    self.stdscr.attroff(curses.A_BOLD)
+                    y += 1
+                    # Separator
+                    self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+                    self.stdscr.addstr(y, start_x, "-" * min(len(person), width - 1))
+                    self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+                except curses.error:
+                    pass
+            else:
+                # Meeting row
+                if is_selected:
+                    self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+                # Format: ID [status] date - title
+                date_str: str = meeting.created.strftime('%Y-%m-%d') if meeting.created else ''
+                status_str: str = meeting.status or ''
+                title_str: str = meeting.title or ''
+
+                # Truncate title to fit
+                id_len: int = len(meeting.id) if meeting.id else 0
+                prefix_len: int = id_len + len(status_str) + len(date_str) + 10
+                max_title: int = width - prefix_len - 4
+                if len(title_str) > max_title:
+                    title_str = title_str[:max_title - 3] + "..."
+
+                row: str = f"  {meeting.id} [{status_str}] {date_str} - {title_str}"
+
+                try:
+                    # Color the status
+                    self.stdscr.addstr(y, start_x, f"  {meeting.id} [")
+                    status_pair: int = ThemeManager.get_status_pair(status_str)
+                    self.stdscr.attron(curses.color_pair(status_pair))
+                    self.stdscr.addstr(status_str)
+                    self.stdscr.attroff(curses.color_pair(status_pair))
+                    self.stdscr.addstr(f"] {date_str} - {title_str}"[:width - len(f"  {meeting.id} [{status_str}]") - 1])
+                except curses.error:
+                    pass
+
+                if is_selected:
+                    self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_SELECTED))
+
+            y += 1
+            row_count += 1
+
+
+# ============================================================================
+# MAIN TUI CLASS
+# ============================================================================
+class VimbanTUI:
+    """
+    Main TUI application class.
+
+    Coordinates all components: state, rendering, input handling,
+    and dialog management.
+    """
+
+    def __init__(
+        self,
+        stdscr: Any,
+        vimban_config: Config,
+        tui_config: TUIConfig
+    ):
+        self.stdscr: Any = stdscr
+        self.vimban_config: Config = vimban_config
+        self.tui_config: TUIConfig = tui_config
+
+        # Initialize managers
+        self.state_manager: StateManager = StateManager(vimban_config, tui_config)
+        self.dialog_manager: DialogManager = DialogManager(stdscr)
+
+        # Initialize markdown renderer
+        self.md_renderer: MarkdownRenderer = MarkdownRenderer()
+
+        # Initialize renderers
+        self.list_renderer: ListRenderer = ListRenderer(
+            stdscr, self.state_manager.state, tui_config
+        )
+        self.kanban_renderer: KanbanRenderer = KanbanRenderer(
+            stdscr, self.state_manager.state, tui_config
+        )
+        self.split_renderer: SplitRenderer = SplitRenderer(
+            stdscr, self.state_manager.state, tui_config, self.md_renderer
+        )
+        self.people_renderer: PeopleRenderer = PeopleRenderer(
+            stdscr, self.state_manager.state, tui_config
+        )
+        self.mentorship_renderer: MentorshipRenderer = MentorshipRenderer(
+            stdscr, self.state_manager.state, tui_config
+        )
+
+        # Apply theme
+        ThemeManager.apply_theme()
+
+        # Configure curses
+        curses.curs_set(0)  # Hide cursor
+        self.stdscr.keypad(True)
+        self.stdscr.timeout(100)  # 100ms timeout for non-blocking input
+
+        # Auto-refresh timer
+        self._last_refresh_time: float = time.monotonic()
+
+    @property
+    def state(self) -> AppState:
+        """Shortcut to access app state."""
+        return self.state_manager.state
+
+    def run(self) -> int:
+        """
+        Main TUI event loop.
+
+        Returns exit code (0 for normal exit).
+        """
+        while True:
+            # Check terminal size
+            if not self._check_terminal_size():
+                key: int = self.stdscr.getch()
+                if key == ord('q'):
+                    return 0
+                continue
+
+            # Draw the screen
+            self._draw()
+
+            # Handle input
+            key = self.stdscr.getch()
+
+            # Auto-refresh on timer
+            current_time: float = time.monotonic()
+            if current_time - self._last_refresh_time >= AUTO_REFRESH_INTERVAL:
+                self.state_manager.refresh_data()
+                self._last_refresh_time = current_time
+
+            if key == -1:  # Timeout, no key pressed
+                continue
+
+            if key == curses.KEY_RESIZE:
+                self._handle_resize()
+                continue
+
+            result: Optional[int] = self._handle_key(key)
+            if result is not None:
+                return result
+
+        return 0
+
+    def _check_terminal_size(self) -> bool:
+        """Check if terminal is large enough."""
+        height, width = self.stdscr.getmaxyx()
+
+        if width < MIN_WIDTH or height < MIN_HEIGHT:
+            self.stdscr.clear()
+            msg: str = f"Terminal too small. Need {MIN_WIDTH}x{MIN_HEIGHT}, got {width}x{height}"
+            try:
+                self.stdscr.addstr(0, 0, msg[:width - 1])
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            return False
+        return True
+
+    def _handle_resize(self) -> None:
+        """Handle terminal resize event."""
+        curses.update_lines_cols()
+        self.stdscr.clear()
+        self.state_manager.clamp_selection()
+
+    def _draw(self) -> None:
+        """Draw the entire TUI screen."""
+        self.stdscr.clear()
+        height, width = self.stdscr.getmaxyx()
+
+        # Draw header
+        self._draw_header(width)
+
+        # Draw main content area
+        content_start_y: int = 2
+        content_height: int = height - 4  # Leave room for header and footer
+
+        if self.state.show_help:
+            self._draw_help(content_start_y, 0, content_height, width)
+        elif self.state.current_view == ViewType.PEOPLE:
+            self.people_renderer.render(content_start_y, 0, content_height, width)
+        elif self.state.current_view == ViewType.MENTORSHIP:
+            self.mentorship_renderer.render(content_start_y, 0, content_height, width)
+        elif self.state.current_view == ViewType.DASHBOARD:
+            self._draw_dashboard(content_start_y, 0, content_height, width)
+        elif self.state.current_view == ViewType.REPORTS:
+            self._draw_reports(content_start_y, 0, content_height, width)
+        elif self.state.current_layout == LayoutType.KANBAN:
+            self.kanban_renderer.render(content_start_y, 0, content_height, width)
+        elif self.state.current_layout == LayoutType.LIST:
+            self.list_renderer.render(content_start_y, 0, content_height, width)
+        elif self.state.current_layout == LayoutType.SPLIT:
+            self.split_renderer.render(content_start_y, 0, content_height, width)
+
+        # Draw footer/status bar
+        self._draw_footer(height - 1, width)
+
+        self.stdscr.refresh()
+
+    def _draw_header(self, width: int) -> None:
+        """Draw the header bar."""
+        view_name: str = self.state.current_view.value.capitalize()
+        layout_name: str = self.state.current_layout.value.capitalize()
+
+        left: str = "VIMBAN TUI"
+        right: str = f"[{view_name}] Layout: {layout_name}  q:quit"
+
+        padding: int = width - len(left) - len(right) - 2
+
+        header: str = f" {left}{' ' * padding}{right} "
+
+        try:
+            self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_HEADER))
+            self.stdscr.addstr(0, 0, header[:width])
+            self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_HEADER))
+        except curses.error:
+            pass
+
+        # Separator line
+        try:
+            self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_BORDER))
+            self.stdscr.addstr(1, 0, "-" * width)
+            self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_BORDER))
+        except curses.error:
+            pass
+
+    def _draw_footer(self, y: int, width: int) -> None:
+        """Draw the footer/status bar."""
+        # Help hints based on current view
+        if self.state.current_view == ViewType.PEOPLE:
+            hints: str = "j/k:navigate  e:edit  i:info  n:new  d:delete  c/C:comment  t:view  TAB:layout  ?:help"
+        else:
+            hints = "j/k:nav  h/l:col  H/L:status  e:edit  i:info  n:new  m:move  M:relocate  c/C:comment  ?:help"
+
+        # Status message overrides hints if present
+        if self.state.status_message:
+            pair: int = (
+                ThemeManager.PAIR_ERROR if self.state.status_is_error
+                else ThemeManager.PAIR_SUCCESS
+            )
+            try:
+                self.stdscr.attron(curses.color_pair(pair))
+                self.stdscr.addstr(y, 0, self.state.status_message[:width - 1])
+                self.stdscr.attroff(curses.color_pair(pair))
+            except curses.error:
+                pass
+            # Clear status after displaying
+            self.state.status_message = ""
+        else:
+            try:
+                self.stdscr.attron(curses.color_pair(ThemeManager.PAIR_HELP))
+                self.stdscr.addstr(y, 0, hints[:width - 1])
+                self.stdscr.attroff(curses.color_pair(ThemeManager.PAIR_HELP))
+            except curses.error:
+                pass
+
+    def _draw_help(
+        self,
+        start_y: int,
+        start_x: int,
+        height: int,
+        width: int
+    ) -> None:
+        """Draw the help overlay."""
+        help_text: list[str] = [
+            "VIMBAN TUI HELP",
+            "",
+            "NAVIGATION",
+            "  j/k       Move down/up",
+            "  h/l       Move left/right (kanban columns)",
+            "  H/L       Move ticket status backward/forward (kanban)",
+            "  gg        Go to top",
+            "  G         Go to bottom",
+            "  Ctrl+d/u  Page down/up",
+            "",
+            "VIEWS & LAYOUTS",
+            "  t         Next view (tickets/people/kanban/dashboard/reports)",
+            "  T         Previous view",
+            "  TAB       Cycle layout (kanban/list/split)",
+            "",
+            "ACTIONS",
+            "  e         Edit selected item in $EDITOR",
+            "  E         Edit ticket metadata (assignee, tags, link/unlink, etc.)",
+            "  i         Show item info (metadata)",
+            "  n         Create new item",
+            "  d         Delete selected item (with confirmation)",
+            "  m         Move ticket to different status",
+            "  M         Move file to different directory",
+            "  A         Archive ticket (done/cancelled only)",
+            "  p         Change ticket priority",
+            "  c         Add comment",
+            "  C         Reply to comment (threaded)",
+            "  r         Toggle markdown rendering",
+            "  R         Refresh data",
+            "  S         Commit and sync with remote (pull/commit/push)",
+            "",
+            "OTHER",
+            "  ?         Toggle this help",
+            "  q         Quit",
+            "",
+            "Press any key to close help..."
+        ]
+
+        for i, line in enumerate(help_text):
+            if i >= height:
+                break
+            try:
+                if i == 0:
+                    self.stdscr.attron(curses.A_BOLD)
+                self.stdscr.addstr(start_y + i, start_x + 2, line[:width - 4])
+                if i == 0:
+                    self.stdscr.attroff(curses.A_BOLD)
+            except curses.error:
+                pass
+
+    def _draw_dashboard(
+        self,
+        start_y: int,
+        start_x: int,
+        height: int,
+        width: int
+    ) -> None:
+        """Draw the dashboard view."""
+        lines: list[str] = [
+            "DASHBOARD VIEW",
+            "",
+            "Coming soon: Daily/Weekly dashboard summaries",
+            "",
+            f"Total tickets: {len(self.state.tickets)}",
+            f"Total people: {len(self.state.people)}",
+        ]
+
+        # Count by status
+        lines.append("")
+        lines.append("BY STATUS:")
+        for status in STATUSES:
+            count: int = len(self.state.kanban_board.get(status, []))
+            if count > 0:
+                lines.append(f"  {status}: {count}")
+
+        for i, line in enumerate(lines):
+            if i >= height:
+                break
+            try:
+                self.stdscr.addstr(start_y + i, start_x + 2, line[:width - 4])
+            except curses.error:
+                pass
+
+    def _draw_reports(
+        self,
+        start_y: int,
+        start_x: int,
+        height: int,
+        width: int
+    ) -> None:
+        """Draw the reports view."""
+        lines: list[str] = [
+            "REPORTS VIEW",
+            "",
+            "Coming soon: Burndown, velocity, workload reports",
+            "",
+            "Press 't' to switch views",
+        ]
+
+        for i, line in enumerate(lines):
+            if i >= height:
+                break
+            try:
+                self.stdscr.addstr(start_y + i, start_x + 2, line[:width - 4])
+            except curses.error:
+                pass
+
+    def _handle_key(self, key: int) -> Optional[int]:
+        """
+        Handle a keypress.
+
+        Returns exit code if should quit, None otherwise.
+        """
+        state: AppState = self.state
+
+        # Handle help overlay
+        if state.show_help:
+            state.show_help = False
+            return None
+
+        # Handle pending vim motions (like 'gg')
+        if state.pending_motion:
+            return self._handle_motion(key)
+
+        # Global keys
+        if key == ord('q'):
+            return 0
+        elif key == ord('?'):
+            state.show_help = True
+        elif key == ord('R'):
+            self.state_manager.refresh_data()
+            self._last_refresh_time = time.monotonic()
+            self.state_manager.set_status("Data refreshed")
+        elif key == ord('\t'):  # TAB
+            self.state_manager.switch_layout()
+        elif key == ord('t'):
+            self.state_manager.switch_view(1)
+        elif key == ord('T'):
+            self.state_manager.switch_view(-1)
+
+        # Navigation
+        elif key == ord('j') or key == curses.KEY_DOWN:
+            self.state_manager.move_selection(delta_row=1)
+        elif key == ord('k') or key == curses.KEY_UP:
+            self.state_manager.move_selection(delta_row=-1)
+        elif key == ord('h') or key == curses.KEY_LEFT:
+            if state.current_layout == LayoutType.KANBAN:
+                self.state_manager.move_selection(delta_col=-1)
+                state.selected_row = 0  # Reset row when changing columns
+        elif key == ord('l') or key == curses.KEY_RIGHT:
+            if state.current_layout == LayoutType.KANBAN:
+                self.state_manager.move_selection(delta_col=1)
+                state.selected_row = 0
+        elif key == ord('H'):
+            self._action_move_backward()
+        elif key == ord('L'):
+            self._action_move_forward()
+        elif key == ord('g'):
+            state.pending_motion = 'g'
+        elif key == ord('G'):
+            self._goto_bottom()
+        elif key == 4:  # Ctrl+d
+            self._page_down()
+        elif key == 21:  # Ctrl+u
+            self._page_up()
+
+        # Actions
+        elif key == ord('e'):
+            self._action_edit()
+        elif key == ord('d'):
+            self._action_delete()
+        elif key == ord('n'):
+            self._action_new()
+        elif key == ord('m'):
+            self._action_move()
+        elif key == ord('p'):
+            self._action_priority()
+        elif key == ord('c'):
+            self._action_comment()
+        elif key == ord('C'):
+            self._action_comment_reply()
+        elif key == ord('r'):
+            self.state.render_markdown = not self.state.render_markdown
+            status: str = "on" if self.state.render_markdown else "off"
+            self.state_manager.set_status(f"Markdown rendering {status}")
+
+        elif key == ord('E'):
+            self._action_edit_metadata()
+
+        elif key == ord('M'):
+            if state.current_view == ViewType.MENTORSHIP:
+                self._action_new_mentor_meeting()
+            else:
+                self._action_move_location()
+
+        elif key == ord('A'):
+            self._action_archive()
+
+        elif key == ord('i'):
+            self._action_info()
+
+        elif key == ord('S'):
+            self._action_commit()
+
+        return None
+
+    def _handle_motion(self, key: int) -> Optional[int]:
+        """Handle compound vim motions like 'gg'."""
+        if self.state.pending_motion == 'g' and key == ord('g'):
+            self._goto_top()
+        self.state.pending_motion = ""
+        return None
+
+    def _goto_top(self) -> None:
+        """Go to the first item."""
+        self.state_manager.move_selection(absolute_row=0)
+        self.state.scroll_offset = 0
+        # Reset kanban scroll for current column
+        if self.state.current_layout == LayoutType.KANBAN:
+            self.state.kanban_scroll_offsets[self.state.selected_col] = 0
+
+    def _goto_bottom(self) -> None:
+        """Go to the last item."""
+        if self.state.current_view == ViewType.PEOPLE:
+            max_row: int = len(self.state.people) - 1
+        elif self.state.current_layout == LayoutType.KANBAN:
+            columns: list[str] = self.tui_config.get_kanban_columns()
+            if columns:
+                status: str = columns[self.state.selected_col]
+                max_row = len(self.state.kanban_board.get(status, [])) - 1
+            else:
+                max_row = 0
+        else:
+            max_row = len(self.state.tickets) - 1
+
+        self.state_manager.move_selection(absolute_row=max(0, max_row))
+
+    def _page_down(self) -> None:
+        """Move down half a page."""
+        height, _ = self.stdscr.getmaxyx()
+        half_page: int = (height - 6) // 2
+        self.state_manager.move_selection(delta_row=half_page)
+
+    def _page_up(self) -> None:
+        """Move up half a page."""
+        height, _ = self.stdscr.getmaxyx()
+        half_page: int = (height - 6) // 2
+        self.state_manager.move_selection(delta_row=-half_page)
+
+    def _action_edit(self) -> None:
+        """Open selected item in editor."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None:
+            self.state_manager.set_status("No item selected", is_error=True)
+            return
+
+        filepath: Path = item.filepath
+        editor: str = os.environ.get('EDITOR', 'nvim')
+
+        # Exit curses temporarily
+        curses.endwin()
+
+        # Open editor
+        subprocess.run([editor, str(filepath)])
+
+        # Restore curses
+        self.stdscr.refresh()
+        curses.doupdate()
+
+        # Refresh data
+        self.state_manager.refresh_data()
+        self.state_manager.set_status(f"Edited {item.id if hasattr(item, 'id') else item.name}")
+
+    def _action_delete(self) -> None:
+        """Delete selected item with confirmation."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None:
+            self.state_manager.set_status("No item selected", is_error=True)
+            return
+
+        item_id: str = item.id if hasattr(item, 'id') and item.id else item.name
+        item_title: str = item.title if hasattr(item, 'title') else item.name
+
+        confirmed: bool = self.dialog_manager.confirm(
+            title=f"Delete {item_id}?",
+            message="This action cannot be undone.",
+            item_title=item_title
+        )
+
+        if not confirmed:
+            self.state_manager.set_status("Delete cancelled")
+            return
+
+        try:
+            item.filepath.unlink()
+            self.state_manager.refresh_data()
+            self.state_manager.set_status(f"Deleted {item_id}")
+        except OSError as e:
+            self.state_manager.set_status(f"Error: {e}", is_error=True)
+
+    def _action_new(self) -> None:
+        """Create a new item."""
+        # Select type
+        item_type: Optional[str] = self.dialog_manager.select_type()
+        if item_type is None:
+            return
+
+        # Get title
+        title: Optional[str] = self.dialog_manager.text_input(
+            f"New {item_type} title:"
+        )
+        if title is None:
+            return
+
+        # Call vimban create
+        curses.endwin()
+
+        cmd: list[str] = [
+            'vimban', 'create', item_type, title,
+            '--directory', str(self.vimban_config.directory)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        self.stdscr.refresh()
+        curses.doupdate()
+
+        if result.returncode == 0:
+            self.state_manager.refresh_data()
+            self.state_manager.set_status(f"Created {item_type}: {title}")
+        else:
+            self.state_manager.set_status(
+                f"Error creating {item_type}",
+                is_error=True
+            )
+
+    def _action_move(self) -> None:
+        """Move ticket to a different status (via dialog)."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None or not isinstance(item, Ticket):
+            self.state_manager.set_status("No ticket selected", is_error=True)
+            return
+
+        new_status: Optional[str] = self.dialog_manager.select_status(item.status)
+        if new_status is None or new_status == item.status:
+            return
+
+        self._do_move(item, new_status)
+
+    def _do_move(self, item: Ticket, new_status: str) -> None:
+        """Execute the move command for a ticket."""
+        cmd: list[str] = [
+            'vimban', '--directory', str(self.vimban_config.directory),
+            'move', item.id, new_status
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            self.state_manager.refresh_data()
+            self.state_manager.set_status(f"Moved {item.id} to {new_status}")
+        else:
+            self.state_manager.set_status(
+                f"Error moving ticket",
+                is_error=True
+            )
+
+    def _action_move_forward(self) -> None:
+        """Move ticket to the next status in the workflow."""
+        if self.state.current_layout != LayoutType.KANBAN:
+            return
+
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None or not isinstance(item, Ticket):
+            self.state_manager.set_status("No ticket selected", is_error=True)
+            return
+
+        # Find current status index and get next
+        try:
+            current_idx: int = STATUSES.index(item.status)
+        except ValueError:
+            return
+
+        if current_idx >= len(STATUSES) - 1:
+            self.state_manager.set_status("Already at last status", is_error=True)
+            return
+
+        new_status: str = STATUSES[current_idx + 1]
+        self._do_move(item, new_status)
+
+    def _action_move_backward(self) -> None:
+        """Move ticket to the previous status in the workflow."""
+        if self.state.current_layout != LayoutType.KANBAN:
+            return
+
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None or not isinstance(item, Ticket):
+            self.state_manager.set_status("No ticket selected", is_error=True)
+            return
+
+        try:
+            current_idx: int = STATUSES.index(item.status)
+        except ValueError:
+            return
+
+        if current_idx <= 0:
+            self.state_manager.set_status("Already at first status", is_error=True)
+            return
+
+        new_status: str = STATUSES[current_idx - 1]
+        self._do_move(item, new_status)
+
+    def _action_move_location(self) -> None:
+        """Move ticket file to a different directory using fzf."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None:
+            self.state_manager.set_status("No item selected", is_error=True)
+            return
+
+        item_id: str = item.id if hasattr(item, 'id') and item.id else item.name
+
+        # Exit curses temporarily
+        curses.endwin()
+
+        # Run vimban move-location with fzf for destination
+        cmd: list[str] = [
+            'vimban', '--directory', str(self.vimban_config.directory),
+            'move-location', item_id
+        ]
+        result = subprocess.run(cmd)
+
+        # Restore curses
+        self.stdscr.refresh()
+        curses.doupdate()
+
+        # Refresh data
+        self.state_manager.refresh_data()
+
+        if result.returncode == 0:
+            self.state_manager.set_status(f"Moved {item_id}")
+        else:
+            self.state_manager.set_status("Move cancelled or failed", is_error=True)
+
+    def _action_archive(self) -> None:
+        """Archive a done or cancelled ticket to 04_archives/."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None:
+            self.state_manager.set_status("No item selected", is_error=True)
+            return
+
+        # Only tickets can be archived
+        if not isinstance(item, Ticket):
+            self.state_manager.set_status("Can only archive tickets, not people", is_error=True)
+            return
+
+        # Check if status is archivable
+        archivable_statuses: list[str] = ['done', 'cancelled']
+        if item.status not in archivable_statuses:
+            self.state_manager.set_status(
+                f"Cannot archive: status '{item.status}' must be done or cancelled",
+                is_error=True
+            )
+            return
+
+        item_id: str = item.id if item.id else str(item.filepath)
+
+        # Exit curses temporarily
+        curses.endwin()
+
+        # Run vimban archive
+        cmd: list[str] = [
+            'vimban', '--directory', str(self.vimban_config.directory),
+            'archive', item_id
+        ]
+        result = subprocess.run(cmd)
+
+        # Restore curses
+        self.stdscr.refresh()
+        curses.doupdate()
+
+        # Refresh data
+        self.state_manager.refresh_data()
+
+        if result.returncode == 0:
+            self.state_manager.set_status(f"Archived {item_id}")
+        else:
+            self.state_manager.set_status("Archive failed", is_error=True)
+
+    def _action_commit(self) -> None:
+        """Run vimban commit to sync changes with remote."""
+        # Exit curses temporarily
+        curses.endwin()
+
+        # Run vimban commit
+        cmd: list[str] = [
+            'vimban', '--directory', str(self.vimban_config.directory),
+            'commit'
+        ]
+
+        print("\nRunning vimban commit...")
+        result = subprocess.run(cmd)
+
+        # Wait for user to see output
+        print("\nPress Enter to continue...")
+        input()
+
+        # Restore curses
+        self.stdscr.refresh()
+        curses.doupdate()
+
+        # Refresh data in case changes came from remote
+        self.state_manager.refresh_data()
+
+        if result.returncode == 0:
+            self.state_manager.set_status("Commit/sync complete")
+        else:
+            self.state_manager.set_status("Commit failed - check output", is_error=True)
+
+    def _action_new_mentor_meeting(self) -> None:
+        """Create a new mentor meeting by prompting for person."""
+        # Get list of people for selection
+        if not self.state.people:
+            self.state_manager.set_status("No people found. Create people first.", is_error=True)
+            return
+
+        # Build person choices
+        person_names: list[str] = [p.name for p in self.state.people]
+
+        # Use fzf to select person
+        curses.endwin()
+
+        try:
+            # Create input for fzf
+            input_data: str = '\n'.join(person_names)
+            result = subprocess.run(
+                ['fzf', '--prompt=Select person: '],
+                input=input_data,
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                self.stdscr.refresh()
+                curses.doupdate()
+                self.state_manager.set_status("Cancelled", is_error=False)
+                return
+
+            selected_person: str = result.stdout.strip()
+
+            # Run vimban mentor new
+            cmd: list[str] = [
+                'vimban', '--directory', str(self.vimban_config.directory),
+                'mentor', 'new', selected_person
+            ]
+            subprocess.run(cmd)
+
+        finally:
+            # Restore curses
+            self.stdscr.refresh()
+            curses.doupdate()
+
+        # Refresh data
+        self.state_manager.refresh_data()
+        self.state_manager.set_status(f"Created mentor meeting with {selected_person}")
+
+    def _action_info(self) -> None:
+        """Show info dialog with metadata for the selected item."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None:
+            self.state_manager.set_status("No item selected", is_error=True)
+            return
+
+        info_lines: list[str] = []
+
+        # Get relative path from vimban directory
+        try:
+            rel_path: str = str(item.filepath.relative_to(self.vimban_config.directory))
+        except ValueError:
+            rel_path = str(item.filepath)
+
+        if isinstance(item, Ticket):
+            # Build ticket info
+            title: str = f"Ticket: {item.id}"
+
+            info_lines.append(f"ID: {item.id}")
+            info_lines.append(f"Title: {item.title}")
+            info_lines.append(f"Type: {item.type}")
+            info_lines.append(f"Status: {item.status}")
+            info_lines.append(f"Priority: {item.priority}")
+            info_lines.append("")
+
+            # Dates
+            info_lines.append(f"Created: {item.created.strftime('%Y-%m-%d %H:%M') if item.created else 'N/A'}")
+            if item.updated:
+                info_lines.append(f"Updated: {item.updated.strftime('%Y-%m-%d %H:%M')}")
+            if item.start_date:
+                info_lines.append(f"Start Date: {item.start_date}")
+            if item.due_date:
+                info_lines.append(f"Due Date: {item.due_date}")
+            if item.end_date:
+                info_lines.append(f"End Date: {item.end_date}")
+            info_lines.append("")
+
+            # People
+            if item.assignee:
+                info_lines.append(f"Assignee: {item.assignee.alias or item.assignee.path}")
+            if item.reporter:
+                info_lines.append(f"Reporter: {item.reporter.alias or item.reporter.path}")
+            if item.watchers:
+                watchers_str: str = ", ".join(w.alias or w.path for w in item.watchers)
+                info_lines.append(f"Watchers: {watchers_str}")
+            info_lines.append("")
+
+            # Classification
+            if item.project:
+                info_lines.append(f"Project: {item.project}")
+            if item.sprint:
+                info_lines.append(f"Sprint: {item.sprint}")
+            if item.tags:
+                info_lines.append(f"Tags: {', '.join(item.tags)}")
+            if item.effort is not None:
+                info_lines.append(f"Effort: {item.effort}")
+            info_lines.append("")
+
+            # Progress
+            if item.progress > 0 or item.checklist_total > 0:
+                info_lines.append(f"Progress: {item.progress}%")
+                if item.checklist_total > 0:
+                    info_lines.append(f"Checklist: {item.checklist_done}/{item.checklist_total}")
+                info_lines.append("")
+
+            # Relationships
+            if item.member_of:
+                member_str: str = ", ".join(m.alias or m.path for m in item.member_of)
+                info_lines.append(f"Member Of: {member_str}")
+            if item.blocked_by:
+                blocked_str: str = ", ".join(b.alias or b.path for b in item.blocked_by)
+                info_lines.append(f"Blocked By: {blocked_str}")
+            if item.blocks:
+                blocks_str: str = ", ".join(b.alias or b.path for b in item.blocks)
+                info_lines.append(f"Blocks: {blocks_str}")
+            if item.relates_to:
+                relates_str: str = ", ".join(r.alias or r.path for r in item.relates_to)
+                info_lines.append(f"Relates To: {relates_str}")
+
+            # External link
+            if item.issue_link:
+                info_lines.append("")
+                info_lines.append(f"Issue Link: {item.issue_link}")
+
+            # Metadata
+            info_lines.append("")
+            info_lines.append(f"Version: {item.version}")
+            info_lines.append(f"Path: {rel_path}")
+
+        else:
+            # Build person info
+            title = f"Person: {item.name}"
+
+            if item.id:
+                info_lines.append(f"ID: {item.id}")
+            info_lines.append(f"Name: {item.name}")
+            info_lines.append("")
+
+            if item.email:
+                info_lines.append(f"Email: {item.email}")
+            if item.slack:
+                info_lines.append(f"Slack: {item.slack}")
+            if item.role:
+                info_lines.append(f"Role: {item.role}")
+            if item.team:
+                info_lines.append(f"Team: {item.team}")
+            info_lines.append("")
+
+            if item.manager:
+                info_lines.append(f"Manager: {item.manager.alias or item.manager.path}")
+            if item.direct_reports:
+                reports_str: str = ", ".join(
+                    r.alias or r.path for r in item.direct_reports
+                )
+                info_lines.append(f"Direct Reports: {reports_str}")
+            info_lines.append("")
+
+            if item.created:
+                info_lines.append(f"Created: {item.created.strftime('%Y-%m-%d %H:%M')}")
+            if item.updated:
+                info_lines.append(f"Updated: {item.updated.strftime('%Y-%m-%d %H:%M')}")
+            info_lines.append("")
+            info_lines.append(f"Path: {rel_path}")
+
+        # Remove consecutive empty lines and trailing empty lines
+        cleaned_lines: list[str] = []
+        prev_empty: bool = False
+        for line in info_lines:
+            if line == "":
+                if not prev_empty:
+                    cleaned_lines.append(line)
+                prev_empty = True
+            else:
+                cleaned_lines.append(line)
+                prev_empty = False
+        # Strip trailing empty lines
+        while cleaned_lines and cleaned_lines[-1] == "":
+            cleaned_lines.pop()
+
+        self.dialog_manager.show_info(title, cleaned_lines)
+
+    def _fzf_select_ticket(
+        self,
+        exclude_id: Optional[str] = None,
+        prompt: str = "Select target: ",
+        ticket_list: Optional[list[Ticket]] = None
+    ) -> Optional[str]:
+        """
+        Use fzf to select a ticket.
+
+        Exits curses temporarily to run fzf with ticket list.
+
+        Args:
+            exclude_id: Ticket ID to exclude from selection
+            prompt: Prompt string for fzf
+            ticket_list: Optional list of tickets to show (defaults to all)
+
+        Returns:
+            Selected ticket ID or None if cancelled.
+        """
+        tickets: list[Ticket] = ticket_list if ticket_list else self.state.tickets
+
+        # Generate fzf input: "ID: Title"
+        ticket_lines: list[str] = [
+            f"{t.id}: {t.title}"
+            for t in tickets
+            if t.id != exclude_id
+        ]
+
+        if not ticket_lines:
+            self.state_manager.set_status("No tickets to select", is_error=True)
+            return None
+
+        # Exit curses temporarily
+        curses.endwin()
+
+        # Run fzf
+        result = subprocess.run(
+            ['fzf', f'--prompt={prompt}'],
+            input='\n'.join(ticket_lines),
+            capture_output=True,
+            text=True
+        )
+
+        # Restore curses
+        self.stdscr.refresh()
+        curses.doupdate()
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+
+        # Parse ID from selection "ID: Title"
+        selected: str = result.stdout.strip()
+        ticket_id: str = selected.split(':')[0].strip()
+        return ticket_id
+
+    def _action_priority(self) -> None:
+        """Change ticket priority."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None or not isinstance(item, Ticket):
+            self.state_manager.set_status("No ticket selected", is_error=True)
+            return
+
+        new_priority: Optional[str] = self.dialog_manager.select_priority(
+            item.priority
+        )
+        if new_priority is None or new_priority == item.priority:
+            return
+
+        # Call vimban edit
+        cmd: list[str] = [
+            'vimban', 'edit', item.id,
+            '--priority', new_priority,
+            '--directory', str(self.vimban_config.directory)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            self.state_manager.refresh_data()
+            self.state_manager.set_status(
+                f"Set {item.id} priority to {new_priority}"
+            )
+        else:
+            self.state_manager.set_status(
+                f"Error changing priority",
+                is_error=True
+            )
+
+    def _action_comment(self) -> None:
+        """Add a comment to the selected item."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None:
+            self.state_manager.set_status("No item selected", is_error=True)
+            return
+
+        comment_text: Optional[str] = self.dialog_manager.text_input(
+            "Comment:"
+        )
+        if comment_text is None:
+            return
+
+        item_ref: str = item.id if hasattr(item, 'id') and item.id else item.name
+
+        # Call vimban comment with default user attribution
+        cmd: list[str] = [
+            'vimban', '--directory', str(self.vimban_config.directory),
+            'comment', item_ref, comment_text,
+            '-u', 'zach_podbielniak'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            self.state_manager.set_status(f"Added comment to {item_ref}")
+        else:
+            self.state_manager.set_status(
+                f"Error adding comment",
+                is_error=True
+            )
+
+    def _action_comment_reply(self) -> None:
+        """Add a threaded reply to an existing comment."""
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None:
+            self.state_manager.set_status("No item selected", is_error=True)
+            return
+
+        item_ref: str = item.id if hasattr(item, 'id') and item.id else item.name
+
+        # Select which comment to reply to
+        reply_to: Optional[int] = self.dialog_manager.select_comment(
+            item_ref, self.vimban_config.directory
+        )
+        if reply_to is None:
+            self.state_manager.set_status("No comments to reply to", is_error=True)
+            return
+
+        # Get reply text
+        comment_text: Optional[str] = self.dialog_manager.text_input(
+            f"Reply to #{reply_to}:"
+        )
+        if comment_text is None:
+            return
+
+        # Call vimban comment with --reply-to and default user attribution
+        cmd: list[str] = [
+            'vimban', '--directory', str(self.vimban_config.directory),
+            'comment', item_ref, comment_text,
+            '--reply-to', str(reply_to),
+            '-u', 'zach_podbielniak'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            self.state_manager.set_status(f"Replied to comment #{reply_to}")
+        else:
+            self.state_manager.set_status(
+                f"Error adding reply",
+                is_error=True
+            )
+
+    def _action_edit_metadata(self) -> None:
+        """
+        Edit ticket metadata through dialogs.
+
+        Provides a menu to select which field to edit, then prompts for the
+        new value using appropriate input dialogs for each field type.
+        """
+        item: Optional[Ticket | Person] = self.state_manager.get_selected_item()
+        if item is None or not isinstance(item, Ticket):
+            self.state_manager.set_status("No ticket selected", is_error=True)
+            return
+
+        # Step 1: Select which field to edit
+        field: Optional[str] = self.dialog_manager.select_edit_field()
+        if field is None:
+            return
+
+        # Step 2: Get new value based on field type
+        cmd_args: list[str] = []
+
+        if field == "assignee":
+            current: str = item.assignee if item.assignee else ""
+            value: Optional[str] = self.dialog_manager.text_input(
+                "Assignee (person ref):",
+                initial=current
+            )
+            if value is None:
+                return
+            cmd_args = ["--assignee", value]
+
+        elif field == "status":
+            value = self.dialog_manager.select_status(item.status)
+            if value is None or value == item.status:
+                return
+            cmd_args = ["--status", value]
+
+        elif field == "priority":
+            value = self.dialog_manager.select_priority(item.priority)
+            if value is None or value == item.priority:
+                return
+            cmd_args = ["--priority", value]
+
+        elif field == "add-tag":
+            value = self.dialog_manager.text_input("Tag to add:")
+            if value is None or not value.strip():
+                return
+            cmd_args = ["--add-tag", value.strip()]
+
+        elif field == "remove-tag":
+            if not item.tags:
+                self.state_manager.set_status("No tags to remove", is_error=True)
+                return
+            value = self.dialog_manager.select_tag(item.tags)
+            if value is None:
+                return
+            cmd_args = ["--remove-tag", value]
+
+        elif field == "progress":
+            current = str(item.progress) if hasattr(item, 'progress') and item.progress else ""
+            value = self.dialog_manager.text_input(
+                "Progress (0-100):",
+                initial=current
+            )
+            if value is None:
+                return
+            cmd_args = ["--progress", value]
+
+        elif field == "due":
+            current = str(item.due_date) if item.due_date else ""
+            value = self.dialog_manager.text_input(
+                "Due date (YYYY-MM-DD or +7d):",
+                initial=current
+            )
+            if value is None:
+                return
+            cmd_args = ["--due", value]
+
+        elif field == "clear":
+            clear_field: Optional[str] = self.dialog_manager.select_clear_field()
+            if clear_field is None:
+                return
+            cmd_args = ["--clear", clear_field]
+
+        elif field == "link":
+            # Handle linking - uses vimban link command
+            relation: Optional[str] = self.dialog_manager.select_link_relation()
+            if relation is None:
+                return
+
+            # Select target ticket via fzf
+            target_id: Optional[str] = self._fzf_select_ticket(
+                exclude_id=item.id,
+                prompt=f"Link {item.id} {relation}: "
+            )
+            if target_id is None:
+                return
+
+            # Run vimban link with bidirectional
+            link_cmd: list[str] = [
+                "vimban",
+                "--directory", str(self.vimban_config.directory),
+                "link", item.id, relation, target_id,
+                "--bidirectional"
+            ]
+            try:
+                result = subprocess.run(link_cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    self.state_manager.refresh_data()
+                    self.state_manager.set_status(f"Linked {item.id} {relation} {target_id}")
+                else:
+                    error_msg: str = result.stderr.strip() if result.stderr else "Unknown error"
+                    self.state_manager.set_status(f"Error: {error_msg[:40]}", is_error=True)
+            except Exception as e:
+                self.state_manager.set_status(f"Error: {e}", is_error=True)
+            return
+
+        elif field == "unlink":
+            # Handle unlinking - uses vimban link --remove command
+            relation = self.dialog_manager.select_link_relation()
+            if relation is None:
+                return
+
+            # Get current links for selected relation
+            current_links: list[TransclusionLink] = []
+            if relation == "member_of":
+                current_links = item.member_of or []
+            elif relation == "blocked_by":
+                current_links = item.blocked_by or []
+            elif relation == "blocks":
+                current_links = item.blocks or []
+            elif relation == "relates_to":
+                current_links = item.relates_to or []
+
+            if not current_links:
+                self.state_manager.set_status(f"No {relation} links to remove", is_error=True)
+                return
+
+            # Build list of linked tickets for fzf selection
+            linked_ids: list[str] = []
+            linked_display: list[str] = []
+            for link in current_links:
+                # Extract ID from path (e.g., "01_projects/TASK-001.md" -> "TASK-001")
+                link_path: str = link.alias or link.path
+                link_id: str = Path(link.path).stem if link.path else link_path
+                linked_ids.append(link_id)
+                linked_display.append(f"{link_id}: {link_path}")
+
+            # Exit curses for fzf
+            curses.endwin()
+
+            result = subprocess.run(
+                ['fzf', f'--prompt=Unlink {relation}: '],
+                input='\n'.join(linked_display),
+                capture_output=True,
+                text=True
+            )
+
+            # Restore curses
+            self.stdscr.refresh()
+            curses.doupdate()
+
+            if result.returncode != 0 or not result.stdout.strip():
+                return
+
+            # Parse target ID
+            selected: str = result.stdout.strip()
+            target_id = selected.split(':')[0].strip()
+
+            # Run vimban link --remove with bidirectional
+            unlink_cmd: list[str] = [
+                "vimban",
+                "--directory", str(self.vimban_config.directory),
+                "link", item.id, relation, target_id,
+                "--remove", "--bidirectional"
+            ]
+            try:
+                result = subprocess.run(unlink_cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    self.state_manager.refresh_data()
+                    self.state_manager.set_status(f"Unlinked {item.id} {relation} {target_id}")
+                else:
+                    error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                    self.state_manager.set_status(f"Error: {error_msg[:40]}", is_error=True)
+            except Exception as e:
+                self.state_manager.set_status(f"Error: {e}", is_error=True)
+            return
+
+        else:
+            return
+
+        # Step 3: Execute vimban edit (for non-link fields)
+        # Note: --directory is a global flag, must come before the subcommand
+        cmd: list[str] = [
+            "vimban",
+            "--directory", str(self.vimban_config.directory),
+            "edit", item.id,
+            *cmd_args
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                self.state_manager.refresh_data()
+                self.state_manager.set_status(f"Updated {item.id}: {field}")
+            else:
+                error_msg: str = result.stderr.strip() if result.stderr else "Unknown error"
+                self.state_manager.set_status(
+                    f"Error: {error_msg[:40]}",
+                    is_error=True
+                )
+        except Exception as e:
+            self.state_manager.set_status(f"Error: {e}", is_error=True)
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Curses-based TUI for vimban ticket management",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    vimban_tui
+    vimban_tui --layout list
+    vimban_tui --view people
+    vimban_tui --work
+    vimban_tui --personal
+    vimban_tui --directory ~/projects/myproject
+        """
+    )
+
+    parser.add_argument(
+        '-V', '--version',
+        action='version',
+        version=f'vimban_tui {VERSION}'
+    )
+
+    parser.add_argument(
+        '--license',
+        action='store_true',
+        help='Show license information and exit'
+    )
+
+    parser.add_argument(
+        '-d', '--directory',
+        type=str,
+        default=None,
+        help='Vimban directory (default: ~/Documents/notes or VIMBAN_DIR)'
+    )
+
+    parser.add_argument(
+        '--layout',
+        type=str,
+        choices=['kanban', 'list', 'split'],
+        help='Initial layout (overrides config)'
+    )
+
+    parser.add_argument(
+        '--view',
+        type=str,
+        choices=['tickets', 'people', 'kanban', 'dashboard', 'reports', 'mentorship'],
+        help='Initial view (overrides config)'
+    )
+
+    parser.add_argument(
+        '--done-last',
+        type=int,
+        default=None,
+        metavar='DAYS',
+        help='Show done tasks completed within DAYS (default: 7, 0=all)'
+    )
+
+    # Scope filtering (mutually exclusive)
+    scope_group = parser.add_mutually_exclusive_group()
+    scope_group.add_argument(
+        '--work',
+        action='store_true',
+        help='Show only work scope tickets and people'
+    )
+    scope_group.add_argument(
+        '--personal',
+        action='store_true',
+        help='Show only personal scope tickets and people'
+    )
+
+    # Archive inclusion flag
+    parser.add_argument(
+        '--archived',
+        action='store_true',
+        help='Include items from 04_archives/ (excluded by default)'
+    )
+
+    parser.add_argument(
+        '--no-pull',
+        action='store_true',
+        help='Skip pulling from remote on startup'
+    )
+
+    return parser.parse_args()
+
+
+def main(stdscr: Any, args: argparse.Namespace) -> int:
+    """Main entry point wrapped by curses."""
+    # Determine vimban directory
+    directory: Path
+    if args.directory:
+        directory = Path(args.directory).expanduser().resolve()
+    else:
+        vimban_dir: str = os.environ.get('VIMBAN_DIR', '')
+        if vimban_dir:
+            directory = Path(vimban_dir).expanduser().resolve()
+        else:
+            directory = DEFAULT_DIR
+
+    # Load configurations
+    vimban_config: Config = Config.load(directory)
+    tui_config: TUIConfig = TUIConfig.load()
+
+    # Apply command-line overrides
+    if args.layout:
+        tui_config.default_layout = LayoutType(args.layout)
+    if args.view:
+        tui_config.default_view = ViewType(args.view)
+    if args.done_last is not None:
+        tui_config.done_last_days = args.done_last
+    if args.work:
+        tui_config.scope = 'work'
+    elif args.personal:
+        tui_config.scope = 'personal'
+    if args.archived:
+        tui_config.include_archived = True
+
+    # Create and run TUI
+    tui: VimbanTUI = VimbanTUI(stdscr, vimban_config, tui_config)
+    return tui.run()
+
+
+def startup_pull(directory: Optional[str] = None) -> bool:
+    """
+    Run vimban commit --pull on startup to sync with remote.
+
+    Args:
+        directory: Optional vimban directory override
+
+    Returns:
+        True if successful, False otherwise
+    """
+    cmd: list[str] = ['vimban', 'commit', '--pull']
+    if directory:
+        cmd.extend(['--directory', directory])
+
+    print("Syncing with remote...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print("Sync complete.")
+        return True
+    else:
+        print(f"Warning: Pull failed: {result.stderr.strip()}")
+        return False
+
+
+if __name__ == "__main__":
+    args: argparse.Namespace = parse_args()
+
+    if args.license:
+        print(LICENSE_TEXT)
+        sys_exit(0)
+
+    # Startup pull unless disabled
+    if not args.no_pull:
+        startup_pull(args.directory)
+
+    try:
+        exit_code: int = curses.wrapper(lambda stdscr: main(stdscr, args))
+        sys_exit(exit_code)
+    except KeyboardInterrupt:
+        sys_exit(0)

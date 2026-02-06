@@ -1,0 +1,135 @@
+#!/bin/bash
+
+# vimban - Markdown-native ticket/kanban management system
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# vimban_resource - Quick resource creation for reference material
+#
+# Usage:
+#   vimban_resource "Resource title"
+#   vimban_resource "Resource title" -t "programming/python"
+#   vimban_resource --work "Work resource"
+#
+# Resources are reference materials and collections of interest.
+# Unlike tasks, they don't have due dates or priorities.
+#
+# Defaults:
+#   reporter: zach_podbielniak
+
+set -euo pipefail
+
+show_help () {
+    cat <<EOF
+vimban_resource - Quick resource creation for reference material
+
+Usage:
+    vimban_resource [options] "Resource title"
+    vimban_resource "Resource title" [vimban options]
+
+Resources are reference materials and collections of interest.
+Unlike tasks, they don't have due dates or priorities.
+
+Defaults:
+    reporter: zach_podbielniak
+
+Options:
+    -h, --help          Show this help message
+    -t, --topic PATH    Set topic path (e.g., 'programming/python')
+    --work              Create in work scope
+    --personal          Create in personal scope
+    -r, --reporter REF  Override reporter (default: zach_podbielniak)
+    --no-edit           Don't open editor after creation (print file path)
+
+Any additional options are passed through to vimban create resource.
+
+Examples:
+    vimban_resource "Bash scripting tips"
+    vimban_resource "Python best practices" -t "programming/python"
+    vimban_resource --work "API documentation"
+    vimban_resource --personal "Recipe collection"
+EOF
+}
+
+# Default values
+topic=""
+scope_arg=""
+reporter="${VIMBAN_REPORTER:-}"
+no_edit=""
+
+# Passthrough args (title, other options)
+passthrough_args=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -t|--topic)
+            topic="${2}"
+            shift 2
+            ;;
+        --work)
+            scope_arg="--work"
+            shift
+            ;;
+        --personal)
+            scope_arg="--personal"
+            shift
+            ;;
+        -r|--reporter)
+            reporter="${2}"
+            shift 2
+            ;;
+        --no-edit)
+            no_edit="--no-edit"
+            shift
+            ;;
+        *)
+            passthrough_args+=("${1}")
+            shift
+            ;;
+    esac
+done
+
+# Check if we have at least a title in passthrough args
+if [[ ${#passthrough_args[@]} -lt 1 ]]
+then
+    echo "Error: Resource title required" >&2
+    echo "Usage: vimban_resource [options] \"Resource title\"" >&2
+    exit 1
+fi
+
+# Build the command
+# shellcheck disable=SC2086
+cmd=(vimban ${scope_arg} create resource -r "${reporter}")
+
+# Add topic if specified
+if [[ -n "${topic}" ]]
+then
+    cmd+=(--topic "${topic}")
+fi
+
+# Add --no-edit if specified
+if [[ -n "${no_edit}" ]]
+then
+    cmd+=(--no-edit)
+fi
+
+# Add passthrough args and execute
+exec "${cmd[@]}" "${passthrough_args[@]}"

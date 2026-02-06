@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# vimban - Markdown-native ticket/kanban management system
+# Copyright (C) 2025  Zach Podbielniak
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# vimban_journal - Quick journal entry creation
+#
+# Usage:
+#   vimban_journal "Journal title"
+#   vimban_journal "Journal title" --date 2025-01-15
+#   vimban_journal --work "Work reflection"
+#
+# Defaults:
+#   ticket_date: today
+#   scope: personal (journals are personal by default)
+#   reporter: zach_podbielniak
+
+set -euo pipefail
+
+show_help () {
+    cat <<EOF
+vimban_journal - Quick journal entry creation
+
+Usage:
+    vimban_journal [options] "Journal title"
+    vimban_journal "Journal title" [vimban options]
+
+Defaults:
+    ticket_date: today
+    scope: personal (journals are personal by default)
+    reporter: zach_podbielniak
+
+Options:
+    -h, --help          Show this help message
+    -d, --date DATE     Set journal date (YYYY-MM-DD, default: today)
+    --work              Create in work scope (overrides personal default)
+    --personal          Create in personal scope (default)
+    -r, --reporter REF  Override reporter (default: zach_podbielniak)
+    --no-edit           Don't open editor after creation (print file path)
+
+Any additional options are passed through to vimban create journal.
+
+Examples:
+    vimban_journal "Daily reflection"
+    vimban_journal "Weekly review" --date 2025-01-15
+    vimban_journal --work "Sprint retrospective thoughts"
+    vimban_journal "Gratitude entry"
+EOF
+}
+
+# Default values
+ticket_date="$(date +%Y-%m-%d)"
+scope_arg="--personal"  # Journals default to personal scope
+reporter="${VIMBAN_REPORTER:-}"
+no_edit=""
+
+# Passthrough args (title, other options)
+passthrough_args=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]
+do
+    case "${1}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -d|--date)
+            ticket_date="${2}"
+            shift 2
+            ;;
+        --work)
+            scope_arg="--work"
+            shift
+            ;;
+        --personal)
+            scope_arg="--personal"
+            shift
+            ;;
+        -r|--reporter)
+            reporter="${2}"
+            shift 2
+            ;;
+        --no-edit)
+            no_edit="--no-edit"
+            shift
+            ;;
+        *)
+            passthrough_args+=("${1}")
+            shift
+            ;;
+    esac
+done
+
+# Check if we have at least a title in passthrough args
+if [[ ${#passthrough_args[@]} -lt 1 ]]
+then
+    echo "Error: Journal title required" >&2
+    echo "Usage: vimban_journal [options] \"Journal title\"" >&2
+    exit 1
+fi
+
+# Build and execute the command
+# shellcheck disable=SC2086
+exec vimban ${scope_arg} create journal \
+    --date "${ticket_date}" \
+    -r "${reporter}" \
+    ${no_edit} \
+    "${passthrough_args[@]}"
