@@ -229,7 +229,7 @@ Launch a full web UI in the browser:
 
 ```bash
 # Via vimban
-vimban --server
+vimban --serve
 
 # Or directly
 vimban_serve
