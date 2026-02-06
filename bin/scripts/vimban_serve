@@ -327,6 +327,9 @@ def _vimban_cmd(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
     """
     Run a vimban CLI command and capture output.
 
+    Global flags (-f, --work, --personal, --archived) are extracted from
+    args and placed before the subcommand so argparse parses them correctly.
+
     Args:
         args: Command arguments (without 'vimban' prefix)
         timeout: Command timeout in seconds
@@ -334,7 +337,22 @@ def _vimban_cmd(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
     Returns:
         Tuple of (return_code, stdout, stderr)
     """
-    cmd: list[str] = ["vimban", "--no-color", "-q"] + args
+    # extract global flags that must come before the subcommand
+    global_flags: list[str] = []
+    subcmd_args: list[str] = []
+    i: int = 0
+    while i < len(args):
+        if args[i] in ("-f", "--format") and i + 1 < len(args):
+            global_flags.extend([args[i], args[i + 1]])
+            i += 2
+        elif args[i] in ("--work", "--personal", "--archived"):
+            global_flags.append(args[i])
+            i += 1
+        else:
+            subcmd_args.append(args[i])
+            i += 1
+
+    cmd: list[str] = ["vimban", "--no-color", "-q"] + global_flags + subcmd_args
     env: dict[str, str] = os.environ.copy()
     env["NO_DBOX_CHECK"] = "1"
     try:
