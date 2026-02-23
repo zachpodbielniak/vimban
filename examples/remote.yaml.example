@@ -14,11 +14,23 @@ work:
   api_token: "your-api-token-here"
 
 # ============================================================================
-# Example: Personal server over HTTPS
+# Example: Personal server over HTTPS (with project key config)
 # ============================================================================
+# project_keys: optional list of ticket ID prefixes used on this remote.
+#   - First entry is the default prefix for new tickets created via --remote.
+#   - Subsequent entries are valid alternates (e.g. for filtering or display).
+#   - If omitted, the server's built-in type defaults apply (e.g. PROJ-, BUG-).
+#   - Use --prefix to override on a per-command basis.
+#
+# Example: vimban --remote config:home create task "fix build"
+#   → creates CLAW-XXXXX on the remote server
 home:
   url: "https://vimban.example.com:5005"
   api_token: "another-token-here"
+  project_keys:
+    - CLAW    # default prefix for new tickets
+    - LIB
+    - CORE
 
 # ============================================================================
 # Example: Local dev server (no auth)

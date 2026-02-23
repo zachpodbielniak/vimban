@@ -110,10 +110,13 @@ if not no_dbox_check and (_dbox_target != ctr_id):
 # ============================================================================
 import argparse
 import curses
+import json
 import os
+import queue as _queue_module
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -198,6 +201,51 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>."""
 # module-level remote state — set at startup if --remote is active
 _tui_remote_url: str | None = None
 _tui_remote_token: str | None = None
+
+# Thread-safe queue for collab SSE events fed by the background daemon thread
+_collab_queue: '_queue_module.Queue[dict]' = _queue_module.Queue()
+
+
+def _collab_sse_thread(remote_url: str, token: str) -> None:
+    """Background daemon thread: subscribe to SSE and feed events into _collab_queue."""
+    import urllib.request
+    sse_url = remote_url.rstrip('/') + '/api/events'
+    headers = {'Accept': 'text/event-stream', 'Authorization': 'Bearer ' + token}
+
+    while True:
+        try:
+            req = urllib.request.Request(sse_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                buffer = ''
+                for raw in resp:
+                    line = raw.decode('utf-8').rstrip('\n').rstrip('\r')
+                    if line.startswith('data:'):
+                        buffer = line[5:].strip()
+                    elif line == '' and buffer:
+                        try:
+                            evt = json.loads(buffer)
+                            _collab_queue.put_nowait(evt)
+                        except Exception:
+                            pass
+                        buffer = ''
+        except Exception:
+            time.sleep(5)  # reconnect after 5s on any error
+
+
+def _handle_collab_event(evt: dict, tui: Any) -> None:
+    """Handle an SSE event in the TUI main loop (called from VimbanTUI.run)."""
+    t = evt.get('type', '')
+    d = evt.get('data', {})
+
+    if t in ('TICKET_CREATED', 'TICKET_UPDATED', 'TICKET_ARCHIVED'):
+        tui.state_manager.refresh_data()
+        tui._last_refresh_time = time.monotonic()
+    elif t in ('PRESENCE_JOIN', 'PRESENCE_LEAVE', 'CONNECTED'):
+        presence = d.get('presence', [])
+        tui.collab_presence = presence
+        # Trigger a redraw so the header shows updated presence
+        tui.state_manager.refresh_data()
+        tui._last_refresh_time = time.monotonic()
 
 
 def _remote_list_tickets(
@@ -2372,6 +2420,9 @@ class VimbanTUI:
         self.remote_url: str | None = remote_url
         self.remote_token: str | None = remote_token
 
+        # Presence list updated by _handle_collab_event from the SSE background thread
+        self.collab_presence: list = []
+
         # Initialize managers
         self.state_manager: StateManager = StateManager(vimban_config, tui_config)
         self.dialog_manager: DialogManager = DialogManager(stdscr)
@@ -2460,6 +2511,14 @@ class VimbanTUI:
                 self.state_manager.refresh_data()
                 self._last_refresh_time = current_time
 
+            # Check for collab events from background SSE thread
+            while not _collab_queue.empty():
+                try:
+                    evt = _collab_queue.get_nowait()
+                    _handle_collab_event(evt, self)
+                except _queue_module.Empty:
+                    break
+
             if key == -1:  # Timeout, no key pressed
                 continue
 
@@ -2535,6 +2594,11 @@ class VimbanTUI:
 
         left: str = "VIMBAN TUI"
         right: str = f"[{view_name}] Layout: {layout_name}  q:quit"
+
+        # Show connected collaborators when in remote mode
+        if self.remote_url and self.collab_presence:
+            users: str = ",".join(str(u) for u in self.collab_presence[:5])
+            right = f"[collab:{users}] {right}"
 
         padding: int = width - len(left) - len(right) - 2
 
@@ -3811,7 +3875,7 @@ def main(stdscr: Any, args: argparse.Namespace) -> int:
     remote_url: str | None = None
     remote_token: str | None = None
     if getattr(args, 'remote', None):
-        remote_url, remote_token = _resolve_remote(args.remote)
+        remote_url, remote_token, _tui_project_keys = _resolve_remote(args.remote)
         if getattr(args, 'api_token', None):
             remote_token = args.api_token
         if getattr(args, 'no_token', False):
@@ -3823,6 +3887,15 @@ def main(stdscr: Any, args: argparse.Namespace) -> int:
         _tui_remote_token = remote_token
         # swap out the data loader for remote mode
         fallback_list_tickets = _remote_list_tickets
+
+    # Start background SSE collab thread when running in remote mode
+    if remote_url:
+        t = threading.Thread(
+            target=_collab_sse_thread,
+            args=(remote_url, remote_token or ''),
+            daemon=True,
+        )
+        t.start()
 
     # Create and run TUI
     tui: VimbanTUI = VimbanTUI(stdscr, vimban_config, tui_config, remote_url, remote_token)

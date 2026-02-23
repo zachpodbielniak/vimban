@@ -193,9 +193,9 @@ def _resolve_template_dir() -> Path:
 REMOTE_CONFIG_FILE: Path = Path.home() / ".config" / "vimban" / "remote.yaml"
 
 
-def _resolve_remote(remote_str: str) -> tuple[str, str | None]:
+def _resolve_remote(remote_str: str) -> tuple[str, str | None, list[str]]:
     """
-    Resolve a --remote value to (url, token).
+    Resolve a --remote value to (url, token, project_keys).
 
     Supports:
         - Direct URL: "http://host:5005" or "https://host:5005/path"
@@ -205,7 +205,9 @@ def _resolve_remote(remote_str: str) -> tuple[str, str | None]:
         remote_str: The --remote argument value
 
     Returns:
-        Tuple of (base_url, api_token_or_None)
+        Tuple of (base_url, api_token_or_None, project_keys)
+        project_keys is [] for direct URLs or when not configured.
+        The first entry in project_keys is the default prefix for new tickets.
     """
     if remote_str.startswith("config:"):
         name: str = remote_str[7:]
@@ -221,12 +223,80 @@ def _resolve_remote(remote_str: str) -> tuple[str, str | None]:
         entry: dict = data[name]
         url: str = entry.get("url", "")
         token: str | None = entry.get("api_token", None)
+        project_keys: list[str] = entry.get("project_keys", [])
         if not url:
             print(f"Error: remote '{name}' has no url defined", file=sys.stderr)
             sys.exit(1)
-        return (url.rstrip("/"), token)
+        return (url.rstrip("/"), token, project_keys)
     else:
-        return (remote_str.rstrip("/"), None)
+        return (remote_str.rstrip("/"), None, [])
+
+
+def _watch_events(remote_url: str, token: str) -> None:
+    """Connect to SSE event stream and display events. Reconnects on drop."""
+    import time
+
+    sse_url = remote_url.rstrip('/') + '/api/events'
+    headers = {'Accept': 'text/event-stream', 'Authorization': 'Bearer ' + token}
+
+    print(f'[vimban watch] connecting to {remote_url} ...', flush=True)
+
+    while True:
+        try:
+            import urllib.request
+            req = urllib.request.Request(sse_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                print('[vimban watch] connected — watching for events (Ctrl+C to exit)', flush=True)
+                buffer = ''
+                for raw in resp:
+                    line = raw.decode('utf-8').rstrip('\n').rstrip('\r')
+                    if line.startswith('data:'):
+                        buffer = line[5:].strip()
+                    elif line == '' and buffer:
+                        try:
+                            evt = json.loads(buffer)
+                            _display_watch_event(evt)
+                        except Exception:
+                            pass
+                        buffer = ''
+        except KeyboardInterrupt:
+            print('\n[vimban watch] disconnected')
+            break
+        except Exception as e:
+            print(f'[vimban watch] connection lost ({e}), reconnecting in 5s...', flush=True)
+            time.sleep(5)
+
+
+def _display_watch_event(evt: dict) -> None:
+    """Print a human-readable line for an SSE event."""
+    t = evt.get('type', '')
+    d = evt.get('data', {})
+    user = d.get('user', '?')
+    tid = d.get('ticket_id', '')
+
+    if t == 'CONNECTED':
+        presence = d.get('presence', [])
+        users = ', '.join(p['user'] for p in presence) if presence else 'none'
+        print(f'  presence: {users}', flush=True)
+    elif t == 'PRESENCE_JOIN':
+        print(f'  >> {d.get("user", "?")} joined', flush=True)
+    elif t == 'PRESENCE_LEAVE':
+        print(f'  << {d.get("user", "?")} left', flush=True)
+    elif t == 'TICKET_CREATED':
+        print(f'  + {user} created {tid}: {d.get("title", "")}', flush=True)
+    elif t == 'TICKET_UPDATED':
+        field = d.get('field', '')
+        value = d.get('value', '')
+        fields = d.get('fields', [])
+        if field:
+            print(f'  ~ {user} moved {tid} -> {value}', flush=True)
+        else:
+            print(f'  ~ {user} edited {tid} ({", ".join(fields)})', flush=True)
+    elif t == 'TICKET_COMMENT':
+        print(f'  > {user} commented on {tid}', flush=True)
+    elif t == 'TICKET_ARCHIVED':
+        print(f'  x {user} archived {tid}', flush=True)
+    # silently ignore keepalive pings (: ping ...) and unknown event types
 
 
 def _remote_request(
@@ -302,7 +372,7 @@ def _remote_request(
         sys.exit(1)
 
 
-def _remote_dispatch(args: argparse.Namespace, remote_url: str, token: str | None) -> int:
+def _remote_dispatch(args: argparse.Namespace, remote_url: str, token: str | None, project_keys: list[str] | None = None) -> int:
     """
     Dispatch a CLI command through the remote API.
 
@@ -313,6 +383,8 @@ def _remote_dispatch(args: argparse.Namespace, remote_url: str, token: str | Non
         args: Parsed argparse namespace with command and subcommand args
         remote_url: Base URL of the remote vimban_serve
         token: Bearer token (or None for --no-token)
+        project_keys: Optional list of project key prefixes from remote config.
+            First entry is the default prefix for new tickets.
 
     Returns:
         Exit code (0 for success)
@@ -373,6 +445,12 @@ def _remote_dispatch(args: argparse.Namespace, remote_url: str, token: str | Non
             create_data["scope"] = "work"
         elif getattr(args, "personal", False):
             create_data["scope"] = "personal"
+        # --prefix flag takes precedence; fall back to first project_key from config
+        explicit_prefix: str = getattr(args, "prefix", None) or ""
+        if explicit_prefix:
+            create_data["prefix"] = explicit_prefix
+        elif project_keys:
+            create_data["prefix"] = project_keys[0]
 
         resp = _remote_request(remote_url, "POST", "/api/tickets", token, data=create_data)
         if resp.get("success"):
@@ -9690,6 +9768,8 @@ Environment Variables:
                         help='API token for remote server authentication')
     parser.add_argument('--no-token', action='store_true',
                         help='Skip sending auth token to remote server')
+    parser.add_argument('--watch', action='store_true',
+                        help='Watch for live events from remote server (requires --remote)')
 
     # Subparsers
     subparsers = parser.add_subparsers(dest='command', help='Commands')
@@ -9925,6 +10005,10 @@ Environment Variables:
     commit_parser.add_argument('-A', '--all', action='store_true', help='Stage all files (default: only vimban files)')
     commit_parser.add_argument('--pull', action='store_true', help='Only pull from remote (no commit/push)')
 
+    # watch (requires --remote)
+    watch_parser = subparsers.add_parser('watch', help='Watch real-time collab events (requires --remote)')
+    watch_parser.add_argument('--format', choices=['plain', 'json'], default='plain', help='Output format')
+
     # people
     people_parser = subparsers.add_parser('people', help='People management')
     people_subparsers = people_parser.add_subparsers(dest='people_command')
@@ -10062,6 +10146,19 @@ def main() -> int:
         result = subprocess.run(serve_cmd, env=env_copy)
         return result.returncode
 
+    # Handle --watch: connect to SSE stream, bypass all subcommand dispatch
+    if getattr(args, 'watch', False):
+        if not getattr(args, 'remote', None):
+            print('Error: --watch requires --remote', file=sys.stderr)
+            sys.exit(1)
+        remote_url, remote_token, _watch_keys = _resolve_remote(args.remote)
+        if getattr(args, 'api_token', None):
+            remote_token = args.api_token
+        if getattr(args, 'no_token', False):
+            remote_token = None
+        _watch_events(remote_url, remote_token or '')
+        sys.exit(0)
+
     # Get directory from args, env, or default
     directory = Path(
         getattr(args, 'directory', None) or
@@ -10085,14 +10182,14 @@ def main() -> int:
 
     # remote mode: route through vimban_serve API instead of local filesystem
     if getattr(args, 'remote', None):
-        remote_url, remote_token = _resolve_remote(args.remote)
+        remote_url, remote_token, remote_project_keys = _resolve_remote(args.remote)
         # --api-token overrides token from remote.yaml
         if getattr(args, 'api_token', None):
             remote_token = args.api_token
         # --no-token means don't send any auth
         if getattr(args, 'no_token', False):
             remote_token = None
-        return _remote_dispatch(args, remote_url, remote_token)
+        return _remote_dispatch(args, remote_url, remote_token, remote_project_keys)
 
     commands = {
         'init': cmd_init,
