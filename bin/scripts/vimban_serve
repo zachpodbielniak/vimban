@@ -93,6 +93,8 @@ import argparse
 import asyncio
 import json
 import re
+import time
+import uuid
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -100,7 +102,7 @@ from datetime import datetime, date, timedelta
 from typing import Any, Optional
 
 try:
-    from quart import Quart, request, jsonify
+    from quart import Quart, request, jsonify, make_response, g
     from quart_cors import cors
 except ImportError:
     print("Error: Quart and quart-cors are required for vimban_serve", file=sys.stderr)
@@ -179,20 +181,23 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>."""
 # ============================================================================
 # TOKEN AUTH
 # ============================================================================
-def _load_tokens(token_path: _Path = TOKEN_FILE) -> set[str]:
+def _load_tokens(token_path: _Path = TOKEN_FILE) -> dict[str, str]:
     """
     Load valid API tokens from the token file.
 
-    Token file format: one token per line. Lines starting with '#' are
-    comments. Blank or whitespace-only lines are ignored.
+    Token file format supports two styles:
+      - username:token  -> maps token to username
+      - bare_token      -> maps token to 'unknown' (backward compat)
+
+    Lines starting with '#' are comments. Blank lines are ignored.
 
     Args:
         token_path: Path to the token file
 
     Returns:
-        Set of valid token strings
+        Dict mapping token -> username
     """
-    tokens: set[str] = set()
+    tokens: dict[str, str] = {}
     if not token_path.exists():
         return tokens
     try:
@@ -201,7 +206,11 @@ def _load_tokens(token_path: _Path = TOKEN_FILE) -> set[str]:
                 stripped: str = line.strip()
                 if not stripped or stripped.startswith("#"):
                     continue
-                tokens.add(stripped)
+                if ":" in stripped:
+                    username, token = stripped.split(":", 1)
+                    tokens[token.strip()] = username.strip()
+                else:
+                    tokens[stripped] = "unknown"
     except OSError:
         pass
     return tokens
@@ -475,6 +484,7 @@ def create_ticket(
     member_of: str = "",
     work: bool = False,
     personal: bool = False,
+    prefix: Optional[str] = None,
 ) -> tuple[bool, str]:
     """
     Create a new ticket.
@@ -499,6 +509,8 @@ def create_ticket(
         args.append("--work")
     if personal:
         args.append("--personal")
+    if prefix:
+        args.extend(["--prefix", prefix])
 
     rc, stdout, stderr = _vimban_cmd(args)
     if rc != 0:
@@ -646,7 +658,36 @@ app = cors(app, allow_origin="*")
 
 # auth state — set at startup based on --no-token flag
 _auth_enabled: bool = True
-_valid_tokens: set[str] = set()
+_valid_tokens: dict[str, str] = {}  # token -> username
+
+
+# --- SSE Collaboration Broker ---
+_sse_clients: dict[str, asyncio.Queue] = {}  # client_id -> Queue
+_presence: dict[str, dict] = {}  # client_id -> {user, connected_at, viewing}
+
+
+def _get_presence_list() -> list[dict]:
+    """Return list of currently connected users."""
+    seen_users = {}
+    for cid, info in _presence.items():
+        user = info['user']
+        if user not in seen_users:
+            seen_users[user] = {'user': user, 'connected_at': info['connected_at'], 'viewing': info.get('viewing')}
+    return list(seen_users.values())
+
+
+async def _broadcast_event(event_type: str, data: dict) -> None:
+    """Broadcast an SSE event to all connected clients."""
+    payload = json.dumps({'type': event_type, 'data': data, 'ts': time.time()})
+    dead = []
+    for cid, q in list(_sse_clients.items()):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            dead.append(cid)
+    for cid in dead:
+        _sse_clients.pop(cid, None)
+        _presence.pop(cid, None)
 
 
 @app.before_request
@@ -658,32 +699,43 @@ async def _check_auth():
     - GET / (HTML UI page)
     - GET /api/health (health check)
     - All routes when --no-token is active
+
+    Sets g.vimban_user to the resolved username for authenticated requests,
+    or None for unauthenticated bypass paths.
     """
     if not _auth_enabled:
+        g.vimban_user = None
         return None
 
     path: str = request.path
 
-    # skip auth for the HTML UI and health check
-    if path == "/" or path == "/api/health":
+    # skip auth for the HTML UI, health check, and presence list
+    if path == "/" or path == "/api/health" or path == "/api/presence":
+        g.vimban_user = None
         return None
 
     # only protect /api/* routes
     if not path.startswith("/api/"):
+        g.vimban_user = None
         return None
 
     auth_header: str | None = request.headers.get("Authorization")
-    if not auth_header:
-        return jsonify({"error": "unauthorized", "message": "Authorization header required"}), 401
-
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "unauthorized", "message": "Bearer token required"}), 401
-
-    token: str = auth_header[7:]
-    if token not in _valid_tokens:
+    if auth_header:
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "unauthorized", "message": "Bearer token required"}), 401
+        token: str = auth_header[7:]
+        if token in _valid_tokens:
+            g.vimban_user = _valid_tokens[token]
+            return None
         return jsonify({"error": "unauthorized", "message": "Invalid token"}), 401
 
-    return None
+    # fallback: check query-param token (for SSE EventSource clients that can't set headers)
+    token = request.args.get('token', '')
+    if token and token in _valid_tokens:
+        g.vimban_user = _valid_tokens[token]
+        return None
+
+    return jsonify({"error": "unauthorized", "message": "Authorization header required"}), 401
 
 
 # ============================================================================
@@ -1557,6 +1609,44 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
         /* ============================================================ */
         .view-panel { display: none; }
         .view-panel.active { display: block; }
+
+        /* ============================================================ */
+        /* COLLAB PRESENCE                                              */
+        /* ============================================================ */
+        .presence-bar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0 8px;
+        }
+        .presence-label {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+        }
+        .presence-dot {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: var(--blue);
+            color: var(--bg-base);
+            font-size: 0.7rem;
+            font-weight: 700;
+            cursor: default;
+        }
+        .presence-offline { color: var(--text-muted); font-size: 0.8rem; }
+        .presence-settings-btn {
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            padding: 2px 5px;
+            border-radius: 4px;
+        }
+        .presence-settings-btn:hover { color: var(--text); background: var(--bg-overlay0); }
     </style>
 </head>
 <body>
@@ -1574,6 +1664,8 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
                 <button class="nav-tab" onclick="switchView('people')">People</button>
             </nav>
             <div class="header-actions">
+                <div class="presence-bar" id="presenceBar"></div>
+                <button class="presence-settings-btn" onclick="openCollabSettings()" title="Collab settings">&#9881;</button>
                 <button class="btn btn-secondary btn-small" onclick="gitSync()">Sync</button>
                 <button class="btn btn-primary btn-small" onclick="openCreateModal()">+ New</button>
             </div>
@@ -1830,8 +1922,11 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
 
         async function api(url, opts = {}) {
             try {
+                const authHeader = collab.token
+                    ? { 'Authorization': 'Bearer ' + collab.token }
+                    : {};
                 const resp = await fetch(url, {
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', ...authHeader },
                     ...opts
                 });
                 return await resp.json();
@@ -2106,7 +2201,9 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
         }
 
         function showDetailModal(t) {
-            document.getElementById('detailModal').classList.add('active');
+            const modal = document.getElementById('detailModal');
+            modal.classList.add('active');
+            modal.dataset.ticketId = t.id || '';
             document.getElementById('detailTitle').textContent = t.id || t.title || 'Detail';
 
             const fields = [
@@ -2306,6 +2403,123 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
         });
 
         /* ============================================================ */
+        /* COLLAB — SSE real-time collaboration                        */
+        /* ============================================================ */
+        const collab = {
+            token: null,
+            user: null,
+            es: null,
+            connected: false,
+            presence: [],
+        };
+
+        function collabInit() {
+            collab.token = localStorage.getItem('vimban_collab_token') || '';
+            if (collab.token) collabConnect();
+        }
+
+        async function collabConnect() {
+            if (collab.es) { collab.es.close(); collab.es = null; }
+
+            /* 1. Hydrate from snapshot before subscribing to event stream */
+            try {
+                const snap = await fetch('/api/snapshot', { headers: { 'Authorization': 'Bearer ' + collab.token } });
+                if (snap.ok) {
+                    const snapData = await snap.json();
+                    collab.presence = snapData.presence || [];
+                    collabRenderPresence();
+                }
+            } catch (_) { /* non-fatal — SSE CONNECTED event will carry presence */ }
+
+            /* 2. Subscribe to event stream (token-only, no ?user= — server resolves identity) */
+            const url = '/api/events?token=' + encodeURIComponent(collab.token);
+            collab.es = new EventSource(url);
+            collab.es.onmessage = (e) => {
+                try { collabHandle(JSON.parse(e.data)); } catch (_) {}
+            };
+            collab.es.onerror = () => {
+                collab.connected = false;
+                collabRenderPresence();
+                /* EventSource auto-reconnects; no manual retry needed */
+            };
+        }
+
+        function collabHandle(msg) {
+            const { type, data } = msg;
+            switch (type) {
+                case 'CONNECTED':
+                    collab.connected = true;
+                    collab.user = data.user || collab.user;
+                    collab.presence = data.presence || [];
+                    collabRenderPresence();
+                    break;
+                case 'PRESENCE_JOIN':
+                case 'PRESENCE_LEAVE':
+                    collab.presence = data.presence || [];
+                    collabRenderPresence();
+                    break;
+                case 'TICKET_CREATED':
+                    if (data.user !== collab.user) {
+                        toast('+ ' + data.user + ' created ' + data.ticket_id, 'success');
+                        refreshCurrentView();
+                    }
+                    break;
+                case 'TICKET_UPDATED':
+                    if (data.user !== collab.user) {
+                        toast('~ ' + data.user + ' updated ' + data.ticket_id, 'success');
+                        refreshCurrentView();
+                    }
+                    break;
+                case 'TICKET_COMMENT':
+                    if (data.user !== collab.user) {
+                        toast('> ' + data.user + ' commented on ' + data.ticket_id, 'success');
+                    }
+                    break;
+                case 'TICKET_ARCHIVED':
+                    if (data.user !== collab.user) {
+                        toast('x ' + data.user + ' archived ' + data.ticket_id, 'success');
+                        refreshCurrentView();
+                    }
+                    break;
+            }
+        }
+
+        function collabRenderPresence() {
+            const bar = document.getElementById('presenceBar');
+            if (!bar) return;
+            if (!collab.token) {
+                bar.innerHTML = '';
+                return;
+            }
+            if (!collab.connected || !collab.presence.length) {
+                bar.innerHTML = '<span class="presence-offline" title="Disconnected">\u25CF</span>';
+                return;
+            }
+            const dots = collab.presence.map(p =>
+                '<span class="presence-dot" title="' + p.user + '">' +
+                p.user.charAt(0).toUpperCase() + '</span>'
+            ).join('');
+            bar.innerHTML = '<span class="presence-label">online:</span>' + dots;
+        }
+
+        function openCollabSettings() {
+            const token = prompt('API token (leave blank to disconnect):', collab.token || '');
+            if (token === null) return;
+            localStorage.setItem('vimban_collab_token', token);
+            collab.token = token;
+            collab.user  = null;  /* will be resolved from token by server on CONNECTED */
+            if (token) {
+                collabConnect();
+            } else if (collab.es) {
+                collab.es.close();
+                collab.es = null;
+                collab.connected = false;
+                collab.presence = [];
+                collabRenderPresence();
+            }
+        }
+
+        /* ============================================================ */
         /* REFRESH                                                      */
         /* ============================================================ */
         function refreshCurrentView() {
@@ -2338,6 +2552,7 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
         /* ============================================================ */
         loadStats();
         loadKanban();
+        collabInit();
     </script>
 </body>
 </html>"""
@@ -2383,6 +2598,7 @@ async def api_create_ticket():
     if not data:
         return jsonify({'success': False, 'message': 'No data provided'}), 400
 
+    prefix = data.get('prefix', None)
     success, msg = create_ticket(
         ticket_type=data.get('type', 'task'),
         title=data.get('title', ''),
@@ -2395,9 +2611,14 @@ async def api_create_ticket():
         member_of=data.get('member_of', ''),
         work=(data.get('scope') == 'work'),
         personal=(data.get('scope') == 'personal'),
+        prefix=prefix if prefix else None,
     )
 
     if success:
+        ticket_id = msg
+        title = data.get('title', '')
+        ticket_type = data.get('type', 'task')
+        await _broadcast_event('TICKET_CREATED', {'ticket_id': ticket_id, 'title': title, 'type': ticket_type, 'status': 'backlog', 'user': getattr(g, 'vimban_user', None) or request.headers.get('X-Vimban-User', 'unknown')})
         return jsonify({'success': True, 'id': msg})
     return jsonify({'success': False, 'message': msg}), 400
 
@@ -2420,6 +2641,8 @@ async def api_move_ticket(ticket_id: str):
         return jsonify({'success': False, 'message': 'Status required'}), 400
 
     success, msg = move_ticket(ticket_id, new_status)
+    if success:
+        await _broadcast_event('TICKET_UPDATED', {'ticket_id': ticket_id, 'field': 'status', 'value': new_status, 'user': getattr(g, 'vimban_user', None) or request.headers.get('X-Vimban-User', 'unknown')})
     return jsonify({'success': success, 'message': msg})
 
 
@@ -2432,6 +2655,8 @@ async def api_add_comment(ticket_id: str):
         return jsonify({'success': False, 'message': 'Comment text required'}), 400
 
     success, msg = add_comment(ticket_id, text)
+    if success:
+        await _broadcast_event('TICKET_COMMENT', {'ticket_id': ticket_id, 'user': getattr(g, 'vimban_user', None) or request.headers.get('X-Vimban-User', 'unknown')})
     return jsonify({'success': success, 'message': msg})
 
 
@@ -2443,6 +2668,8 @@ async def api_edit_ticket(ticket_id: str):
         return jsonify({'success': False, 'message': 'No data provided'}), 400
 
     success, msg = edit_ticket(ticket_id, data)
+    if success:
+        await _broadcast_event('TICKET_UPDATED', {'ticket_id': ticket_id, 'fields': list(data.keys()), 'user': getattr(g, 'vimban_user', None) or request.headers.get('X-Vimban-User', 'unknown')})
     return jsonify({'success': success, 'message': msg})
 
 
@@ -2483,12 +2710,106 @@ async def api_health():
     return jsonify({'status': 'ok', 'version': VERSION})
 
 
+@app.route('/api/presence')
+async def api_presence():
+    """Get currently connected users."""
+    return jsonify({'presence': _get_presence_list(), 'count': len(set(p['user'] for p in _presence.values()))})
+
+
+@app.route('/api/snapshot')
+async def api_snapshot():
+    """Return full current state snapshot for SSE client initialization.
+
+    Called immediately after SSE connect so clients can reconcile any
+    events missed before the stream was established.
+
+    Returns:
+        JSON with tickets list, presence list, and server timestamp.
+    """
+    tickets: list[dict[str, Any]] = list_tickets()
+    presence: list[dict] = _get_presence_list()
+    return jsonify({
+        'tickets': tickets,
+        'presence': presence,
+        'ts': time.time(),
+    })
+
+
+@app.route('/api/events')
+async def api_events():
+    """SSE endpoint for real-time collaboration events."""
+    _load_tokens()
+
+    # Auth: check header OR query param (EventSource can't set headers)
+    authed = not _auth_enabled
+    if not authed:
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+            authed = token in _valid_tokens
+        if not authed:
+            token = request.args.get('token', '')
+            authed = token in _valid_tokens
+
+    if not authed:
+        return jsonify({'error': 'unauthorized', 'message': 'Valid token required'}), 401
+
+    # Resolve user from token (authoritative identity — not spoofable via ?user=)
+    token = request.headers.get('Authorization', '').removeprefix('Bearer ').strip() or request.args.get('token', '')
+    user = _valid_tokens.get(token, 'unknown')
+    client_id = str(uuid.uuid4())
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _sse_clients[client_id] = q
+    _presence[client_id] = {'user': user, 'connected_at': time.time(), 'viewing': None}
+
+    # Notify others of new presence
+    await _broadcast_event('PRESENCE_JOIN', {'user': user, 'presence': _get_presence_list()})
+
+    async def event_stream():
+        try:
+            # Send initial connection confirmation with current presence
+            connected_msg = json.dumps({
+                'type': 'CONNECTED',
+                'data': {'client_id': client_id, 'user': user, 'presence': _get_presence_list()},
+                'ts': time.time()
+            })
+            yield f'data: {connected_msg}\n\n'
+
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=30.0)
+                    yield f'data: {msg}\n\n'
+                except asyncio.TimeoutError:
+                    # Keepalive comment to prevent connection timeout
+                    yield f': ping {int(time.time())}\n\n'
+        finally:
+            _sse_clients.pop(client_id, None)
+            _presence.pop(client_id, None)
+            # Fire and forget presence leave (we're in a generator finally block)
+            asyncio.ensure_future(
+                _broadcast_event('PRESENCE_LEAVE', {'user': user, 'presence': _get_presence_list()})
+            )
+
+    response = await make_response(
+        event_stream(),
+        200,
+        {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        }
+    )
+    return response
+
+
 @app.route('/api/ticket/<ticket_id>/archive', methods=['POST'])
 async def api_archive_ticket(ticket_id: str):
     """Archive a ticket (move to archived status)."""
     rc, stdout, stderr = _vimban_cmd(["archive", ticket_id])
     if rc != 0:
         return jsonify({'success': False, 'message': stderr.strip() or 'Failed to archive'}), 400
+    await _broadcast_event('TICKET_ARCHIVED', {'ticket_id': ticket_id, 'user': getattr(g, 'vimban_user', None) or request.headers.get('X-Vimban-User', 'unknown')})
     return jsonify({'success': True, 'message': f'Archived {ticket_id}'})
 
 
