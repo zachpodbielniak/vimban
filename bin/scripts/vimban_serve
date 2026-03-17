@@ -118,7 +118,7 @@ except ImportError:
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-VERSION: str = "0.2.1"
+VERSION: str = "0.3.0"
 DEFAULT_PORT: int = 5005
 DEFAULT_BIND: str = "127.0.0.1"
 TOKEN_FILE: _Path = _Path.home() / ".config" / "vimban" / "token"
@@ -966,6 +966,49 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
             align-items: center;
         }
 
+        /* ============================================================ */
+        /* PROJECT TABS                                                 */
+        /* ============================================================ */
+        .project-tabs {
+            display: flex;
+            gap: 4px;
+            padding: 8px 0 0 0;
+            border-bottom: 2px solid var(--bg-surface0);
+            margin-bottom: 12px;
+            overflow-x: auto;
+            flex-wrap: nowrap;
+        }
+
+        .project-tab {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            padding: 6px 14px;
+            border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.85rem;
+            white-space: nowrap;
+            position: relative;
+            transition: color 0.15s, background 0.15s;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+        }
+
+        .project-tab:hover { color: var(--text); background: var(--bg-surface0); }
+        .project-tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+        .project-tab .badge {
+            background: var(--bg-surface1);
+            color: var(--text-sub);
+            font-size: 0.7rem;
+            padding: 1px 5px;
+            border-radius: 8px;
+            margin-left: 5px;
+        }
+
+        .project-tab.active .badge { background: var(--blue); color: var(--bg-base); }
+
         select {
             padding: 8px 12px;
             background: var(--bg-base);
@@ -1680,6 +1723,10 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
 
         <!-- KANBAN VIEW -->
         <div class="view-panel active" id="view-kanban">
+            <div class="project-tabs" id="projectTabs">
+                <button class="project-tab active" data-project="" id="projectTabAll">All Projects</button>
+                <!-- dynamically populated by loadProjects() -->
+            </div>
             <div class="toolbar">
                 <div class="search-box">
                     <input type="text" class="search-input" id="kanbanSearch"
@@ -1905,6 +1952,7 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
         /* ============================================================ */
         let currentView = 'kanban';
         let allTickets = [];
+        let currentProject = localStorage.getItem('vimban_project') || '';
         let listSortField = 'id';
         let listSortAsc = true;
 
@@ -1970,7 +2018,7 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
             event.target.classList.add('active');
             document.getElementById('view-' + view).classList.add('active');
 
-            if (view === 'kanban') loadKanban();
+            if (view === 'kanban') { loadProjects(); loadKanban(); }
             else if (view === 'list') loadList();
             else if (view === 'dashboard') loadDashboard('daily');
             else if (view === 'people') loadPeople();
@@ -2003,6 +2051,49 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
         }
 
         /* ============================================================ */
+        /* PROJECT TABS                                                 */
+        /* ============================================================ */
+        async function loadProjects() {
+            const data = await api('/api/projects');
+            if (!data) return;
+            const bar = document.getElementById('projectTabs');
+            // Wire up "All Projects" button programmatically
+            const allBtn = document.getElementById('projectTabAll');
+            allBtn.onclick = () => setProject(allBtn, '');
+            // Remove all tabs except "All Projects"
+            bar.querySelectorAll('.project-tab:not(#projectTabAll)').forEach(el => el.remove());
+            data.projects.forEach(p => {
+                const btn = document.createElement('button');
+                btn.className = 'project-tab' + (currentProject === p.name ? ' active' : '');
+                btn.dataset.project = p.name;
+                btn.onclick = () => setProject(btn, p.name);
+                const nameNode = document.createTextNode(p.name);
+                btn.appendChild(nameNode);
+                if (p.count) {
+                    const badge = document.createElement('span');
+                    badge.className = 'badge';
+                    badge.textContent = p.count;
+                    btn.appendChild(badge);
+                }
+                bar.appendChild(btn);
+            });
+            // Ensure "All" tab has correct active state
+            bar.querySelector('[data-project=""]').classList.toggle('active', currentProject === '');
+            // Restore persisted project if it no longer exists (e.g. all tickets archived)
+            const exists = currentProject === '' || data.projects.some(p => p.name === currentProject);
+            if (!exists) { currentProject = ''; localStorage.removeItem('vimban_project'); }
+        }
+
+        function setProject(btn, project) {
+            currentProject = project;
+            if (project) localStorage.setItem('vimban_project', project);
+            else localStorage.removeItem('vimban_project');
+            document.querySelectorAll('.project-tab').forEach(t => t.classList.remove('active'));
+            btn.classList.add('active');
+            loadKanban();
+        }
+
+        /* ============================================================ */
         /* KANBAN VIEW                                                  */
         /* ============================================================ */
         async function loadKanban() {
@@ -2014,6 +2105,7 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
             if (priority) url += '&priority=' + priority;
             if (type) url += '&type=' + type;
             if (scope) url += '&scope=' + scope;
+            if (currentProject) url += '&project=' + encodeURIComponent(currentProject);
 
             const data = await api(url);
             if (!data) return;
@@ -2551,6 +2643,7 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
         /* INIT                                                         */
         /* ============================================================ */
         loadStats();
+        loadProjects();
         loadKanban();
         collabInit();
     </script>
@@ -2874,6 +2967,25 @@ async def api_kanban():
     return jsonify({'board': board})
 
 
+@app.route('/api/projects')
+async def api_projects():
+    """Return all unique project keys with open ticket counts."""
+    if _proxy_enabled:
+        resp: dict = _remote_request(_proxy_url, "GET", "/api/projects", _proxy_token)
+        return jsonify(resp)
+    tickets: list[dict[str, Any]] = list_tickets(include_done=False)
+    project_counts: dict[str, int] = {}
+    for t in tickets:
+        p: str = t.get('project', '')
+        if p:
+            project_counts[p] = project_counts.get(p, 0) + 1
+    projects: list[dict] = sorted(
+        [{'name': k, 'count': v} for k, v in project_counts.items()],
+        key=lambda x: x['name']
+    )
+    return jsonify({'projects': projects})
+
+
 @app.route('/api/commit', methods=['POST'])
 async def api_commit():
     """Run vimban commit (with optional --pull)."""
@@ -2989,6 +3101,10 @@ def _proxy_vimban_cmd(args: list[str], timeout: int = 30) -> tuple[int, str, str
         elif cmd == "kanban":
             resp = _remote_request(_proxy_url, "GET", "/api/kanban", _proxy_token)
             return (0, json.dumps(resp.get("board", {})), "")
+
+        elif cmd == "projects":
+            resp = _remote_request(_proxy_url, "GET", "/api/projects", _proxy_token)
+            return (0, json.dumps(resp.get("projects", [])), "")
 
         elif cmd == "commit":
             pull: bool = "--pull" in rest
