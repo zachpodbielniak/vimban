@@ -8498,7 +8498,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
                 changes_made = True
 
             if due_date:
-                parsed_date = parse_relative_date(due_date)
+                parsed_date = parse_date(due_date)
                 if parsed_date:
                     metadata['due_date'] = str(parsed_date)
                     changes_made = True
@@ -8510,7 +8510,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
 
             if changes_made:
                 metadata['updated'] = datetime.now().isoformat()
-                new_content = format_frontmatter(metadata) + body
+                new_content = dump_frontmatter(metadata, body)
                 ticket_path.write_text(new_content)
 
             ticket_obj = Ticket.from_file(ticket_path)
@@ -8574,7 +8574,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
                 comment_block = f"\n\n---\n**#{comment_id}** | {user} | {timestamp}\n\n{transition_comment}\n"
                 body = body.rstrip() + comment_block
 
-            new_content = format_frontmatter(metadata) + body
+            new_content = dump_frontmatter(metadata, body)
             ticket_path.write_text(new_content)
 
             ticket_obj = Ticket.from_file(ticket_path)
@@ -8640,7 +8640,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
             metadata[relation] = links
             metadata['updated'] = datetime.now().isoformat()
 
-            new_content = format_frontmatter(metadata) + body
+            new_content = dump_frontmatter(metadata, body)
             source_path.write_text(new_content)
 
             if bidirectional:
@@ -8670,7 +8670,7 @@ def create_mcp_server(host: str = "127.0.0.1", port: int = 5004):
                 target_metadata[reverse_relation] = target_links
                 target_metadata['updated'] = datetime.now().isoformat()
 
-                target_new = format_frontmatter(target_metadata) + target_body
+                target_new = dump_frontmatter(target_metadata, target_body)
                 target_path.write_text(target_new)
 
             return {"success": True, "message": f"Link {'removed' if remove else 'created'}"}
