@@ -1724,7 +1724,7 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
         <!-- KANBAN VIEW -->
         <div class="view-panel active" id="view-kanban">
             <div class="project-tabs" id="projectTabs">
-                <button class="project-tab active" data-project="" onclick="setProject(this, '')">All Projects</button>
+                <button class="project-tab active" data-project="" id="projectTabAll">All Projects</button>
                 <!-- dynamically populated by loadProjects() -->
             </div>
             <div class="toolbar">
@@ -2057,14 +2057,24 @@ HTML_TEMPLATE: str = """<!DOCTYPE html>
             const data = await api('/api/projects');
             if (!data) return;
             const bar = document.getElementById('projectTabs');
+            // Wire up "All Projects" button programmatically
+            const allBtn = document.getElementById('projectTabAll');
+            allBtn.onclick = () => setProject(allBtn, '');
             // Remove all tabs except "All Projects"
-            bar.querySelectorAll('.project-tab:not([data-project=""])').forEach(el => el.remove());
+            bar.querySelectorAll('.project-tab:not(#projectTabAll)').forEach(el => el.remove());
             data.projects.forEach(p => {
                 const btn = document.createElement('button');
                 btn.className = 'project-tab' + (currentProject === p.name ? ' active' : '');
                 btn.dataset.project = p.name;
                 btn.onclick = () => setProject(btn, p.name);
-                btn.innerHTML = p.name + (p.count ? ` <span class="badge">${p.count}</span>` : '');
+                const nameNode = document.createTextNode(p.name);
+                btn.appendChild(nameNode);
+                if (p.count) {
+                    const badge = document.createElement('span');
+                    badge.className = 'badge';
+                    badge.textContent = p.count;
+                    btn.appendChild(badge);
+                }
                 bar.appendChild(btn);
             });
             // Ensure "All" tab has correct active state
@@ -2960,6 +2970,9 @@ async def api_kanban():
 @app.route('/api/projects')
 async def api_projects():
     """Return all unique project keys with open ticket counts."""
+    if _proxy_enabled:
+        resp: dict = _remote_request(_proxy_url, "GET", "/api/projects", _proxy_token)
+        return jsonify(resp)
     tickets: list[dict[str, Any]] = list_tickets(include_done=False)
     project_counts: dict[str, int] = {}
     for t in tickets:
