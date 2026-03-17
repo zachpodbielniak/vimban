@@ -636,7 +636,7 @@ def _output_remote_data(data: Any, fmt: str, context: str) -> None:
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-VERSION: str = "0.2.0"
+VERSION: str = "0.2.1"
 DEFAULT_DIR: Path = Path.home() / "Documents" / "notes"
 DEFAULT_PEOPLE_DIR: str = "02_areas/work/people"
 DEFAULT_PREFIX: str = "PROJ"

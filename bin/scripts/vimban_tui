@@ -173,7 +173,7 @@ DEFAULT_DIR = vimban.DEFAULT_DIR
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-VERSION: str = "0.2.0"
+VERSION: str = "0.2.1"
 MIN_WIDTH: int = 80
 MIN_HEIGHT: int = 24
 AUTO_REFRESH_INTERVAL: int = 30  # seconds

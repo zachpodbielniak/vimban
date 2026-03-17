@@ -118,7 +118,7 @@ except ImportError:
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-VERSION: str = "0.2.0"
+VERSION: str = "0.2.1"
 DEFAULT_PORT: int = 5005
 DEFAULT_BIND: str = "127.0.0.1"
 TOKEN_FILE: _Path = _Path.home() / ".config" / "vimban" / "token"
