@@ -536,6 +536,14 @@ vimban_exec (VimbanTUI *tui, gchar **argv_extra)
     g_ptr_array_add(args, (gpointer)"--no-color");
     g_ptr_array_add(args, (gpointer)"-q");
 
+    /* inject scope as global flags (must come before subcommand) */
+    if (tui->config->scope) {
+        if (g_strcmp0(tui->config->scope, "work") == 0)
+            g_ptr_array_add(args, (gpointer)"--work");
+        else if (g_strcmp0(tui->config->scope, "personal") == 0)
+            g_ptr_array_add(args, (gpointer)"--personal");
+    }
+
     for (i = 0; argv_extra && argv_extra[i]; i++)
         g_ptr_array_add(args, argv_extra[i]);
 
@@ -857,15 +865,9 @@ tui_load_data (VimbanTUI *tui)
 
     tui_free_data(tui);
 
-    /* Build ticket list argv with scope flags */
+    /* Build ticket list argv (scope flags injected by vimban_exec) */
     list_args = g_ptr_array_new();
     g_ptr_array_add(list_args, (gpointer)"list");
-    if (tui->config->scope) {
-        if (g_strcmp0(tui->config->scope, "work") == 0)
-            g_ptr_array_add(list_args, (gpointer)"--work");
-        else if (g_strcmp0(tui->config->scope, "personal") == 0)
-            g_ptr_array_add(list_args, (gpointer)"--personal");
-    }
     g_ptr_array_add(list_args, NULL);
     list_argv = (gchar **)list_args->pdata;
 
