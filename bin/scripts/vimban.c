@@ -899,6 +899,7 @@ vimban_transclusion_link_parse (const gchar *text)
 
     /* try transclusion: ![[path]] or ![[path|alias]] */
     re_trans = g_regex_new (TRANSCLUSION_RE, 0, 0, NULL);
+    if (!re_trans) return NULL;
     if (g_regex_match (re_trans, trimmed, 0, &info))
     {
         link = g_new0 (VimbanTransclusionLink, 1);
@@ -916,6 +917,7 @@ vimban_transclusion_link_parse (const gchar *text)
 
     /* try markdown link: [text](path) */
     re_md = g_regex_new (MARKDOWN_LINK_RE, 0, 0, NULL);
+    if (!re_md) return NULL;
     if (g_regex_match (re_md, trimmed, 0, &info))
     {
         link = g_new0 (VimbanTransclusionLink, 1);
@@ -1086,6 +1088,11 @@ vimban_fill_template (const gchar  *tmpl,
         g_autofree gchar *old = result;
         g_autofree gchar *escaped = g_regex_escape_string ((const gchar *)key, -1);
         g_autoptr(GRegex) regex = g_regex_new (escaped, 0, 0, NULL);
+        if (!regex)
+        {
+            result = g_strdup (old);
+            continue;
+        }
         result = g_regex_replace_literal (
             regex, old, -1, 0, (const gchar *)value, 0, NULL);
         if (!result)
@@ -1207,6 +1214,8 @@ vimban_dump_frontmatter (YamlMapping *mapping,
     root = yaml_node_new_mapping (mapping);
     yaml_generator_set_root (gen, root);
     yaml_str = yaml_generator_to_data (gen, &len, NULL);
+    if (!yaml_str)
+        yaml_str = g_strdup ("");
 
     if (body && body[0])
         return g_strdup_printf ("---\n%s---\n\n%s", yaml_str, body);
@@ -3197,6 +3206,9 @@ vimban_format_output_md (const GPtrArray  *tickets,
 
     out = g_string_new ("");
 
+    /* compile pipe-escape regex once, not per-cell */
+    g_autoptr(GRegex) pipe_re = g_regex_new ("\\|", 0, 0, NULL);
+
     if (!no_header)
     {
         /* header row */
@@ -3224,9 +3236,9 @@ vimban_format_output_md (const GPtrArray  *tickets,
         {
             g_autofree gchar *val = vimban_ticket_get_field (t, columns[c]);
             /* escape pipe chars */
-            g_autofree gchar *escaped = g_regex_replace_literal (
-                g_regex_new ("\\|", 0, 0, NULL),
-                val, -1, 0, "\\|", 0, NULL);
+            g_autofree gchar *escaped = pipe_re
+                ? g_regex_replace_literal (pipe_re, val, -1, 0, "\\|", 0, NULL)
+                : NULL;
             if (c > 0) g_string_append (out, " | ");
             g_string_append (out, escaped ? escaped : val);
         }
@@ -3455,8 +3467,8 @@ vimban_filter_tickets (const GPtrArray *tickets,
         {
             if (!t->assignee) continue;
             {
-                g_autofree gchar *a_lower = g_ascii_strdown (
-                    vimban_transclusion_link_to_string (t->assignee), -1);
+                g_autofree gchar *link_str = vimban_transclusion_link_to_string (t->assignee);
+                g_autofree gchar *a_lower = g_ascii_strdown (link_str, -1);
                 g_autofree gchar *f_lower = g_ascii_strdown (assignee, -1);
                 if (!strstr (a_lower, f_lower)) continue;
             }
@@ -3905,7 +3917,7 @@ cmd_init (gint              argc,
         if (g_file_test (gitignore_path, G_FILE_TEST_EXISTS))
         {
             g_file_get_contents (gitignore_path, &gitignore_content, NULL, NULL);
-            if (!strstr (gitignore_content, ".vimban/.sequence"))
+            if (gitignore_content && !strstr (gitignore_content, ".vimban/.sequence"))
             {
                 g_autofree gchar *appended = g_strdup_printf (
                     "%s\n.vimban/.sequence\n", gitignore_content);
@@ -4057,6 +4069,12 @@ cmd_create (gint              argc,
     /* generate ID */
     ticket_id = vimban_next_id (config->directory, opt_id,
                                  opt_prefix, type_str, config);
+    if (!ticket_id)
+    {
+        vimban_error ("Failed to generate ticket ID (sequence lock failed)",
+                      VIMBAN_EXIT_GENERAL_ERROR);
+        return VIMBAN_EXIT_GENERAL_ERROR;
+    }
 
     /* resolve people */
     if (opt_assignee && opt_assignee[0])
@@ -4965,7 +4983,11 @@ cmd_edit (gint              argc,
     g_autofree gchar *body = NULL;
     YamlMapping *mapping = NULL;
 
-    g_file_get_contents (ticket->filepath, &raw, NULL, NULL);
+    if (!g_file_get_contents (ticket->filepath, &raw, NULL, NULL))
+    {
+        g_printerr ("Error: cannot read ticket file: %s\n", ticket->filepath);
+        return VIMBAN_EXIT_GENERAL_ERROR;
+    }
     vimban_parse_frontmatter (raw, &mapping, &body);
     if (!mapping) mapping = yaml_mapping_new ();
 
@@ -5179,7 +5201,12 @@ cmd_move (gint              argc,
     g_autofree gchar *body = NULL;
     YamlMapping *mapping = NULL;
 
-    g_file_get_contents (ticket->filepath, &raw, NULL, NULL);
+    if (!g_file_get_contents (ticket->filepath, &raw, NULL, NULL))
+    {
+        g_printerr ("Error: cannot read ticket file: %s\n", ticket->filepath);
+        g_free (opt_comment);
+        return VIMBAN_EXIT_GENERAL_ERROR;
+    }
     vimban_parse_frontmatter (raw, &mapping, &body);
     if (!mapping) mapping = yaml_mapping_new ();
 
@@ -5449,7 +5476,11 @@ cmd_link (gint              argc,
     g_autofree gchar *raw = NULL;
     g_autofree gchar *body = NULL;
     YamlMapping *mapping = NULL;
-    g_file_get_contents (ticket->filepath, &raw, NULL, NULL);
+    if (!g_file_get_contents (ticket->filepath, &raw, NULL, NULL))
+    {
+        g_printerr ("Error: cannot read ticket file: %s\n", ticket->filepath);
+        return VIMBAN_EXIT_GENERAL_ERROR;
+    }
     vimban_parse_frontmatter (raw, &mapping, &body);
     if (!mapping) mapping = yaml_mapping_new ();
 
@@ -6446,7 +6477,8 @@ cmd_search (gint              argc,
     const gchar *query = argv[1];
 
     /* build rg command */
-    GPtrArray *cmd_arr = g_ptr_array_new ();
+    GPtrArray *cmd_arr = g_ptr_array_new_with_free_func (NULL);
+    gchar *ctx_str_copy = NULL;
     g_ptr_array_add (cmd_arr, (gpointer) "rg");
 
     if (!opt_case_sensitive)
@@ -6459,8 +6491,8 @@ cmd_search (gint              argc,
     else if (opt_context > 0)
     {
         g_ptr_array_add (cmd_arr, (gpointer) "-C");
-        g_autofree gchar *ctx_str = g_strdup_printf ("%d", opt_context);
-        g_ptr_array_add (cmd_arr, g_strdup (ctx_str));
+        ctx_str_copy = g_strdup_printf ("%d", opt_context);
+        g_ptr_array_add (cmd_arr, ctx_str_copy);
     }
 
     if (opt_regex)
@@ -6486,8 +6518,8 @@ cmd_search (gint              argc,
                                 &rg_stdout, &rg_stderr,
                                 &exit_status, &spawn_err);
 
-    /* free any context string copies */
-    g_ptr_array_free (cmd_arr, FALSE);
+    g_ptr_array_free (cmd_arr, TRUE);
+    g_free (ctx_str_copy);
 
     if (!ok)
     {
@@ -6504,7 +6536,7 @@ cmd_search (gint              argc,
     g_free (rg_stdout);
     g_free (rg_stderr);
 
-    return (WEXITSTATUS (exit_status) == 0)
+    return (WIFEXITED (exit_status) && WEXITSTATUS (exit_status) == 0)
         ? VIMBAN_EXIT_SUCCESS
         : VIMBAN_EXIT_GENERAL_ERROR;
 }
@@ -6789,7 +6821,7 @@ cmd_commit (gint              argc,
         gboolean _ok = g_spawn_sync (config->directory, git_argv, NULL, \
             G_SPAWN_SEARCH_PATH, NULL, NULL, \
             &_out, &_err, &_exit, &_ge); \
-        if (!_ok || WEXITSTATUS (_exit) != 0) { \
+        if (!_ok || !WIFEXITED (_exit) || WEXITSTATUS (_exit) != 0) { \
             g_autofree gchar *_msg = g_strdup_printf ("%s: %s", fail_msg, \
                 _err ? g_strstrip (_err) : (_ge ? _ge->message : "failed")); \
             vimban_error (_msg, VIMBAN_EXIT_GIT_ERROR); \
@@ -6826,7 +6858,7 @@ cmd_commit (gint              argc,
         g_spawn_sync (config->directory, pull_argv, NULL,
                       G_SPAWN_SEARCH_PATH, NULL, NULL,
                       &pull_out, &pull_err, &pull_exit, NULL);
-        if (WEXITSTATUS (pull_exit) != 0)
+        if (!WIFEXITED (pull_exit) || WEXITSTATUS (pull_exit) != 0)
         {
             g_autofree gchar *msg = g_strdup_printf (
                 "git pull failed: %s",
@@ -6914,7 +6946,7 @@ cmd_commit (gint              argc,
         gboolean c_ok = g_spawn_sync (config->directory, commit_argv, NULL,
                                        G_SPAWN_SEARCH_PATH, NULL, NULL,
                                        &c_out, &c_err, &c_exit, NULL);
-        if (!c_ok || WEXITSTATUS (c_exit) != 0)
+        if (!c_ok || !WIFEXITED (c_exit) || WEXITSTATUS (c_exit) != 0)
         {
             g_autofree gchar *msg = g_strdup_printf (
                 "git commit failed: %s",
@@ -6947,7 +6979,7 @@ cmd_commit (gint              argc,
             g_spawn_sync (config->directory, push_argv, NULL,
                           G_SPAWN_SEARCH_PATH, NULL, NULL,
                           &p_out, &p_err, &p_exit, NULL);
-            if (WEXITSTATUS (p_exit) != 0)
+            if (!WIFEXITED (p_exit) || WEXITSTATUS (p_exit) != 0)
             {
                 g_autofree gchar *msg = g_strdup_printf (
                     "git push failed: %s",
@@ -7105,6 +7137,11 @@ cmd_people (gint              argc,
 
         g_autofree gchar *person_id = vimban_next_id (
             config->directory, NULL, NULL, "person", config);
+        if (!person_id)
+        {
+            vimban_error ("Failed to generate person ID", VIMBAN_EXIT_GENERAL_ERROR);
+            return VIMBAN_EXIT_GENERAL_ERROR;
+        }
 
         g_autoptr(GDateTime) now = g_date_time_new_now_local ();
         g_autofree gchar *now_str = g_date_time_format_iso8601 (now);
@@ -7250,6 +7287,11 @@ cmd_mentor (gint              argc,
 
         g_autofree gchar *ticket_id = vimban_next_id (
             config->directory, NULL, NULL, "mentorship", config);
+        if (!ticket_id)
+        {
+            vimban_error ("Failed to generate mentorship ID", VIMBAN_EXIT_GENERAL_ERROR);
+            return VIMBAN_EXIT_GENERAL_ERROR;
+        }
 
         g_autoptr(GDateTime) now = g_date_time_new_now_local ();
         g_autofree gchar *now_str = g_date_time_format_iso8601 (now);
@@ -7743,6 +7785,8 @@ mcp_handle_create_ticket (McpServer   *server,
 
 	ticket_id = vimban_next_id (ctx->config->directory, NULL, NULL,
 	                             type_str, ctx->config);
+	if (!ticket_id)
+		return mcp_result_error ("Failed to generate ticket ID (sequence lock failed)");
 
 	if (assignee && assignee[0])
 		assignee_link = vimban_resolve_person_ref (
@@ -7899,7 +7943,8 @@ mcp_handle_edit_ticket (McpServer   *server,
 		return mcp_result_error (msg);
 	}
 
-	g_file_get_contents (ticket->filepath, &raw, NULL, NULL);
+	if (!g_file_get_contents (ticket->filepath, &raw, NULL, NULL))
+		return mcp_result_error ("Failed to read ticket file");
 	vimban_parse_frontmatter (raw, &mapping, &body);
 	if (!mapping) mapping = yaml_mapping_new ();
 
@@ -8512,6 +8557,8 @@ mcp_handle_create_person (McpServer   *server,
 
 	person_id = vimban_next_id (ctx->config->directory, NULL, NULL,
 	                             "person", ctx->config);
+	if (!person_id)
+		return mcp_result_error ("Failed to generate person ID (sequence lock failed)");
 	now     = g_date_time_new_now_local ();
 	now_str = g_date_time_format_iso8601 (now);
 
@@ -9830,7 +9877,8 @@ vimban_find_command_index (gint argc, gchar **argv)
         /* skip option flags and their values */
         if (argv[i][0] == '-')
         {
-            /* options that take a value: skip next arg too */
+            /* options that take a value: skip next arg too
+             * (but not if value is embedded via --option=value) */
             if (g_strcmp0 (argv[i], "-d") == 0 ||
                 g_strcmp0 (argv[i], "--directory") == 0 ||
                 g_strcmp0 (argv[i], "-f") == 0 ||
@@ -9839,6 +9887,13 @@ vimban_find_command_index (gint argc, gchar **argv)
                 g_strcmp0 (argv[i], "--api-token") == 0)
             {
                 i++; /* skip the value */
+            }
+            else if (g_str_has_prefix (argv[i], "--directory=") ||
+                     g_str_has_prefix (argv[i], "--format=") ||
+                     g_str_has_prefix (argv[i], "--remote=") ||
+                     g_str_has_prefix (argv[i], "--api-token="))
+            {
+                /* value embedded in same arg — do not skip next */
             }
             continue;
         }

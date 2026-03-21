@@ -2597,9 +2597,9 @@ static const gchar *EMBEDDED_HTML =
 	"\n"
 	"        async function openPersonDetail(id) {\n"
 	"            /* re-use the detail modal for person info */\n"
-	"            const data = await api('/api/ticket/' + encodeURIComponent(id));\n"
-	"            if (!data || !data.ticket) { toast('Person not found', 'error'); return; }\n"
-	"            showDetailModal(data.ticket);\n"
+	"            const data = await api('/api/person/' + encodeURIComponent(id));\n"
+	"            if (!data || !data.person) { toast('Person not found', 'error'); return; }\n"
+	"            showDetailModal(data.person);\n"
 	"        }\n"
 	"\n"
 	"        /* ============================================================ */\n"
@@ -3383,7 +3383,7 @@ handle_ticket_dispatch(
 				/* CRIT-1: use build_error_json */
 				g_autofree gchar *emsg = build_error_json(FALSE,
 					stderr_str ? stderr_str : "Failed to move ticket");
-				respond_json(msg, 200, emsg);
+				respond_json(msg, 400, emsg);
 				return;
 			}
 			{
@@ -3436,7 +3436,7 @@ handle_ticket_dispatch(
 				/* CRIT-1: use build_error_json */
 				g_autofree gchar *emsg = build_error_json(FALSE,
 					stderr_str ? stderr_str : "Failed to add comment");
-				respond_json(msg, 200, emsg);
+				respond_json(msg, 400, emsg);
 				return;
 			}
 			{
@@ -3518,7 +3518,7 @@ handle_ticket_dispatch(
 				/* CRIT-1: use build_error_json */
 				g_autofree gchar *emsg = build_error_json(FALSE,
 					stderr_str ? stderr_str : "Failed to edit ticket");
-				respond_json(msg, 200, emsg);
+				respond_json(msg, 400, emsg);
 			} else {
 				/* CRIT-2: build SSE event with JsonBuilder */
 				g_autofree gchar *ev = build_sse_event_json(
@@ -3652,7 +3652,7 @@ handle_search(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -3717,7 +3717,7 @@ handle_dashboard(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -3786,7 +3786,7 @@ handle_kanban(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -3937,7 +3937,7 @@ handle_people(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -3987,7 +3987,7 @@ handle_person_dispatch(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -4118,7 +4118,7 @@ handle_projects(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -4237,7 +4237,7 @@ handle_commit(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -4338,7 +4338,7 @@ handle_validate(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -4679,7 +4679,7 @@ handle_mentor(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -4812,7 +4812,7 @@ handle_generate_link(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -4884,7 +4884,7 @@ handle_convert(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -4983,7 +4983,7 @@ handle_report(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -5031,9 +5031,10 @@ handle_report(
 			}
 			/* If JSON invalid, fall through to plain text */
 		}
-		g_free(stdout_str);
-		stdout_str = NULL;
+		/* g_autofree handles stdout_str cleanup at block exit */
+	}
 
+	{
 		/* Fallback: plain text */
 		{
 			const gchar *argv_txt[] = { "report", report_type, NULL };
@@ -5095,7 +5096,7 @@ handle_sync(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -5143,7 +5144,7 @@ handle_snapshot(
 	}
 
 	{
-		gchar *user = NULL;
+		g_autofree gchar *user = NULL;
 		if (!check_auth(app, msg, path, &user)) return;
 	}
 
@@ -5429,8 +5430,13 @@ main(
 	{
 		const gchar *bind_addr = opt_bind ? opt_bind : DEFAULT_BIND;
 		GInetAddress *ia    = g_inet_address_new_from_string(bind_addr);
-		g_autoptr(GSocketAddress) sa =
-			(GSocketAddress *)g_inet_socket_address_new(ia, (guint16)opt_port);
+		g_autoptr(GSocketAddress) sa = NULL;
+		if (!ia) {
+			g_printerr("Error: invalid bind address '%s'\n", bind_addr);
+			g_free(opt_bind);
+			return 1;
+		}
+		sa = (GSocketAddress *)g_inet_socket_address_new(ia, (guint16)opt_port);
 		g_object_unref(ia);
 
 		if (!soup_server_listen(app->server, sa, 0, &err)) {

@@ -1701,7 +1701,8 @@ static const gchar *HELP_LINES[] = {
     "  A           Archive ticket",
     "  p           Change priority",
     "  c           Add comment",
-    "  r           Refresh data",
+    "  r           Toggle markdown rendering",
+    "  R           Refresh data",
     "  S           Commit & sync (git pull/push)",
     "",
     "OTHER",
@@ -2188,7 +2189,7 @@ action_new (VimbanTUI *tui)
                  G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
                  NULL, NULL, NULL, NULL, &exit_status, &err);
 
-    if (exit_status == 0) {
+    if (!err && exit_status == 0) {
         gchar *msg = g_strdup_printf("Created %s: %s", type_sel, title);
         tui_load_data(tui);
         tui_set_status(tui, msg, FALSE);
@@ -2224,7 +2225,7 @@ action_move (VimbanTUI *tui)
                  G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
                  NULL, NULL, NULL, NULL, &exit_status, &err);
 
-    if (exit_status == 0) {
+    if (!err && exit_status == 0) {
         gchar *id_copy = g_strdup(t->id);
         gchar *msg = g_strdup_printf("Moved %s to %s", id_copy, new_status);
         tui_load_data(tui);
@@ -2268,7 +2269,7 @@ action_move_status_delta (VimbanTUI *tui, gint delta)
                  G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
                  NULL, NULL, NULL, NULL, &exit_status, &err);
 
-    if (exit_status == 0) {
+    if (!err && exit_status == 0) {
         gchar *id_copy = g_strdup(t->id);
         gchar *msg = g_strdup_printf("Moved %s to %s", id_copy, STATUSES[new_idx]);
         tui_load_data(tui);
@@ -2348,7 +2349,7 @@ action_priority (VimbanTUI *tui)
                  G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
                  NULL, NULL, NULL, NULL, &exit_status, &err);
 
-    if (exit_status == 0) {
+    if (!err && exit_status == 0) {
         gchar *id_copy = g_strdup(t->id);
         gchar *msg = g_strdup_printf("Set %s priority to %s", id_copy, new_pri);
         tui_load_data(tui);
@@ -2382,7 +2383,7 @@ action_comment (VimbanTUI *tui)
     gchar *argv[] = {
         "vimban", "--directory", tui->directory,
         "comment", (gchar *)item_id, comment,
-        "-u", "zach_podbielniak", NULL
+        "-u", (gchar *)g_get_user_name(), NULL
     };
     g_autoptr(GError) err = NULL;
     gint exit_status = 0;
@@ -2390,7 +2391,7 @@ action_comment (VimbanTUI *tui)
                  G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
                  NULL, NULL, NULL, NULL, &exit_status, &err);
 
-    if (exit_status == 0) {
+    if (!err && exit_status == 0) {
         gchar *msg = g_strdup_printf("Added comment to %s", item_id);
         tui_set_status(tui, msg, FALSE);
         g_free(msg);
@@ -2544,7 +2545,7 @@ action_comment_reply (VimbanTUI *tui)
                     "vimban", "--directory", tui->directory,
                     "comment", (gchar *)item_id, reply_text,
                     "--reply-to", reply_to_str,
-                    "-u", "zach_podbielniak", NULL
+                    "-u", (gchar *)g_get_user_name(), NULL
                 };
                 g_autoptr(GError) err = NULL;
                 gint exit_status = 0;
@@ -2554,7 +2555,7 @@ action_comment_reply (VimbanTUI *tui)
                                                  | G_SPAWN_STDERR_TO_DEV_NULL,
                              NULL, NULL, NULL, NULL, &exit_status, &err);
 
-                if (exit_status == 0) {
+                if (!err && exit_status == 0) {
                     gchar *msg = g_strdup_printf("Replied to comment #%d", reply_to);
                     tui_set_status(tui, msg, FALSE);
                     g_free(msg);
@@ -2826,7 +2827,7 @@ action_edit_metadata (VimbanTUI *tui)
                      G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
                      NULL, NULL, NULL, NULL, &exit_status, &err);
 
-        if (exit_status == 0) {
+        if (!err && exit_status == 0) {
             gchar *id_copy = g_strdup(t->id);
             gchar *msg = g_strdup_printf("Updated %s: %s", id_copy, field);
             tui_load_data(tui);
@@ -2867,7 +2868,7 @@ action_archive (VimbanTUI *tui)
 
     tui_restore_ncurses();
 
-    if (exit_status == 0) {
+    if (!err && exit_status == 0) {
         gchar *id_copy = g_strdup(t->id);
         gchar *msg;
         tui_load_data(tui);
@@ -2905,7 +2906,7 @@ action_move_location (VimbanTUI *tui)
     tui_restore_ncurses();
     tui_load_data(tui);
 
-    if (exit_status == 0)
+    if (!err && exit_status == 0)
         tui_set_status(tui, "Moved", FALSE);
     else
         tui_set_status(tui, "Move cancelled or failed", TRUE);
@@ -2932,7 +2933,7 @@ action_commit (VimbanTUI *tui)
                  NULL, NULL, NULL, NULL, &exit_status, &err);
 
     /* show result and wait for user to press Enter */
-    if (exit_status == 0)
+    if (!err && exit_status == 0)
         g_print("\nCommit successful.\n");
     else
         g_print("\nCommit failed.\n");
@@ -2948,7 +2949,7 @@ action_commit (VimbanTUI *tui)
     tui_restore_ncurses();
     tui_load_data(tui);
 
-    if (exit_status == 0)
+    if (!err && exit_status == 0)
         tui_set_status(tui, "Committed successfully", FALSE);
     else
         tui_set_status(tui, "Commit failed", TRUE);
