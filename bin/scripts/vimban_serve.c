@@ -485,6 +485,10 @@ vimban_cmd(
  * for all methods so POST responses are not blocked by the browser
  * when accessed cross-origin or through a proxy.
  *
+ * TODO: In production, restrict Access-Control-Allow-Origin to specific
+ * origins instead of "*". This requires C code changes to read allowed
+ * origins from config and match against the request Origin header.
+ *
  * @msg: The SoupServerMessage to annotate.
  */
 static void
@@ -2508,6 +2512,7 @@ static const gchar *EMBEDDED_HTML =
 	"            if (!data) return;\n"
 	"            const tickets = data.tickets || [];\n"
 	"\n"
+	"            /* NOTE: these statuses must match STATUSES[] in vimban binary (minus done/cancelled for kanban) */\n"
 	"            const columns = ['backlog', 'ready', 'in_progress', 'blocked', 'review', 'delegated'];\n"
 	"            const board = document.getElementById('kanbanBoard');\n"
 	"\n"
@@ -2761,7 +2766,7 @@ static const gchar *EMBEDDED_HTML =
 	"                <div style=\"display:flex;gap:8px;margin-top:16px;flex-wrap:wrap;\">\n"
 	"                    <select id=\"moveStatus\" style=\"flex:1\">\n"
 	"                        <option value=\"\">Move to...</option>\n"
-	"                        ${['backlog','ready','in_progress','blocked','review','delegated','done','cancelled']\n"
+	"                        ${/* NOTE: must match STATUSES[] in vimban binary */['backlog','ready','in_progress','blocked','review','delegated','done','cancelled']\n"
 	"                            .filter(s => s !== t.status)\n"
 	"                            .map(s => '<option value=\"' + s + '\">' + s.replace(/_/g,' ') + '</option>')\n"
 	"                            .join('')}\n"
@@ -2769,7 +2774,7 @@ static const gchar *EMBEDDED_HTML =
 	"                    <button class=\"btn btn-secondary btn-small\" data-ticket-id=\"${escapeHtml(t.id)}\" onclick=\"moveTicket(this.dataset.ticketId)\">Move</button>\n"
 	"                    <select id=\"editPriority\" style=\"flex:1\">\n"
 	"                        <option value=\"\">Set priority...</option>\n"
-	"                        ${['critical','high','medium','low']\n"
+	"                        ${/* NOTE: must match PRIORITIES[] in vimban binary */['critical','high','medium','low']\n"
 	"                            .filter(p => p !== t.priority)\n"
 	"                            .map(p => '<option value=\"' + p + '\">' + p + '</option>')\n"
 	"                            .join('')}\n"
@@ -2798,15 +2803,22 @@ static const gchar *EMBEDDED_HTML =
 	"        async function moveTicket(id) {\n"
 	"            const status = document.getElementById('moveStatus').value;\n"
 	"            if (!status) return;\n"
+	"            /* Optimistic update: move card in UI immediately */\n"
+	"            const prevTickets = [...allTickets];\n"
+	"            const ticket = allTickets.find(t => t.id === id);\n"
+	"            if (ticket) ticket.status = status;\n"
+	"            closeModal('detailModal');\n"
+	"            refreshCurrentView();\n"
 	"            const data = await api('/api/ticket/' + id + '/move', {\n"
 	"                method: 'POST',\n"
 	"                body: JSON.stringify({ status })\n"
 	"            });\n"
 	"            if (data && data.success) {\n"
 	"                toast(`Moved ${id} to ${status}`);\n"
-	"                closeModal('detailModal');\n"
-	"                refreshCurrentView();\n"
 	"            } else {\n"
+	"                /* Revert on failure */\n"
+	"                allTickets.splice(0, allTickets.length, ...prevTickets);\n"
+	"                refreshCurrentView();\n"
 	"                toast(typeof data?.message === 'string' ? data.message : 'Failed to move', 'error');\n"
 	"            }\n"
 	"        }\n"
@@ -2937,10 +2949,17 @@ static const gchar *EMBEDDED_HTML =
 	"            collab.es.onmessage = (e) => {\n"
 	"                try { collabHandle(JSON.parse(e.data)); } catch (err) { console.warn('SSE parse error:', err, e.data); }\n"
 	"            };\n"
+	"            collab.es.onopen = () => { collab._retryDelay = 1000; };\n"
 	"            collab.es.onerror = () => {\n"
 	"                collab.connected = false;\n"
 	"                collabRenderPresence();\n"
-	"                /* EventSource auto-reconnects; no manual retry needed */\n"
+	"                /* Close broken connection and reconnect with backoff */\n"
+	"                if (collab.es && collab.es.readyState === EventSource.CLOSED) {\n"
+	"                    collab.es = null;\n"
+	"                    const delay = collab._retryDelay || 1000;\n"
+	"                    collab._retryDelay = Math.min(delay * 2, 30000);\n"
+	"                    setTimeout(() => { if (collab.token) collabConnect(); }, delay);\n"
+	"                }\n"
 	"            };\n"
 	"        }\n"
 	"\n"
