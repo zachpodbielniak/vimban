@@ -4409,10 +4409,16 @@ handle_projects(
 				const gchar *proj = NULL;
 				const gchar *st   = NULL;
 
-				/* Skip done/cancelled tickets in project counts */
+				/* Only count tickets with active kanban statuses (skip done, cancelled, and non-kanban statuses like "active") */
 				if (json_object_has_member(t, "status"))
 					st = json_object_get_string_member(t, "status");
-				if (g_strcmp0(st, "done") == 0 || g_strcmp0(st, "cancelled") == 0)
+				if (!st ||
+				    (g_strcmp0(st, "backlog")     != 0 &&
+				     g_strcmp0(st, "ready")       != 0 &&
+				     g_strcmp0(st, "in_progress") != 0 &&
+				     g_strcmp0(st, "blocked")     != 0 &&
+				     g_strcmp0(st, "review")      != 0 &&
+				     g_strcmp0(st, "delegated")   != 0))
 					continue;
 
 				if (json_object_has_member(t, "project"))
