@@ -38,7 +38,7 @@
  * Constants
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define VIMBAN_SERVE_VERSION   "0.3.0"
+#define VIMBAN_SERVE_VERSION   "0.4.0"
 #define DEFAULT_PORT           (5005)
 #define DEFAULT_BIND           "127.0.0.1"
 #define TOKEN_FILE_RELPATH     ".config/vimban/token"
