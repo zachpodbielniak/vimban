@@ -47,6 +47,7 @@
 #define CMD_TIMEOUT_LONG_SEC   (60)   /* for commit/sync */
 #define SSE_MAX_CLIENTS        (64)   /* HIGH-4: cap on concurrent SSE connections */
 #define MAX_REQUEST_BODY_SIZE  (1 * 1024 * 1024)  /* LOW-3: 1 MB body limit */
+#define CACHE_TTL_SEC          (5)               /* command cache TTL */
 
 /* Canonical ticket statuses */
 static const gchar * const STATUSES[] = {
@@ -342,6 +343,46 @@ constant_time_str_equal(
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Command cache — avoid re-spawning vimban for identical read-only queries
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+	gchar   *output;
+	gint64   timestamp;  /* g_get_monotonic_time() in microseconds */
+} CacheEntry;
+
+static GHashTable *cmd_cache  = NULL;  /* key: gchar*, value: CacheEntry* */
+
+static void
+cache_entry_free(gpointer data)
+{
+	CacheEntry *e = data;
+	g_free(e->output);
+	g_free(e);
+}
+
+static void
+cache_init(void)
+{
+	cmd_cache = g_hash_table_new_full(g_str_hash, g_str_equal,
+	                                  g_free, cache_entry_free);
+}
+
+static void
+cache_invalidate(void)
+{
+	if (cmd_cache)
+		g_hash_table_remove_all(cmd_cache);
+}
+
+static gchar *
+cache_key_from_argv(const gchar * const *argv)
+{
+	return g_strjoinv("\x1f", (gchar **)argv);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * CLI wrapper
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -470,6 +511,43 @@ vimban_cmd(
 	g_ptr_array_free(subcmd_args, TRUE);
 	g_ptr_array_free(cmd_argv, TRUE);
 
+	return rc;
+}
+
+
+/*
+ * vimban_cmd_cached() — cached wrapper around vimban_cmd() for read-only
+ * endpoints. Returns cached output when available and within CACHE_TTL_SEC.
+ */
+static gint
+vimban_cmd_cached(
+	VimbanServeApp      *app,
+	const gchar * const *args,
+	gint                 timeout,
+	gchar              **out_stdout,
+	gchar              **out_stderr
+){
+	gchar      *key    = cache_key_from_argv(args);
+	gint64      now    = g_get_monotonic_time();
+	CacheEntry *cached = NULL;
+	gint        rc;
+
+	cached = g_hash_table_lookup(cmd_cache, key);
+	if (cached && (now - cached->timestamp) < ((gint64)CACHE_TTL_SEC * G_USEC_PER_SEC)) {
+		*out_stdout = g_strdup(cached->output);
+		if (out_stderr) *out_stderr = g_strdup("");
+		g_free(key);
+		return 0;
+	}
+
+	rc = vimban_cmd(app, args, timeout, out_stdout, out_stderr);
+	if (rc == 0 && *out_stdout) {
+		CacheEntry *entry = g_new0(CacheEntry, 1);
+		entry->output    = g_strdup(*out_stdout);
+		entry->timestamp = now;
+		g_hash_table_replace(cmd_cache, g_strdup(key), entry);
+	}
+	g_free(key);
 	return rc;
 }
 
@@ -3083,9 +3161,7 @@ static const gchar *EMBEDDED_HTML =
 	"        /* ============================================================ */\n"
 	"        /* INIT                                                         */\n"
 	"        /* ============================================================ */\n"
-	"        loadStats();\n"
-	"        loadProjects();\n"
-	"        loadKanban();\n"
+	"        Promise.all([loadStats(), loadProjects(), loadKanban()]);\n"
 	"        collabInit();\n"
 	"    </script>\n"
 	"</body>\n"
@@ -3204,7 +3280,7 @@ handle_tickets(
 
 		{
 			gchar *out = NULL, *err_out = NULL;
-			gint   rc  = vimban_cmd(app, (const gchar * const *)args->pdata,
+			gint   rc  = vimban_cmd_cached(app, (const gchar * const *)args->pdata,
 			                        CMD_TIMEOUT_SEC, &out, &err_out);
 			g_autofree gchar *stdout_str = out;
 			g_autofree gchar *stderr_str = err_out;
@@ -3317,6 +3393,7 @@ handle_tickets(
 					stderr_str ? stderr_str : "Failed to create ticket");
 				respond_json(msg, 400, emsg);
 			} else {
+				cache_invalidate();
 				/* Extract ticket ID from output (e.g. PROJ-00042) */
 				GRegex  *re = g_regex_new("([A-Z]+-[0-9]+)", 0, 0, NULL);
 				GMatchInfo *mi = NULL;
@@ -3420,7 +3497,7 @@ handle_ticket_dispatch(
 	if (g_strcmp0(method, "GET") == 0 && !action) {
 		const gchar *argv[] = { "show", ticket_id, "-f", "json", NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_autofree gchar *stderr_str = err_out;
 
@@ -3440,7 +3517,7 @@ handle_ticket_dispatch(
 	if (g_strcmp0(method, "GET") == 0 && g_strcmp0(action, "comments") == 0) {
 		const gchar *argv[] = { "comments", ticket_id, "-f", "json", NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_autofree gchar *stderr_str = err_out;
 
@@ -3501,6 +3578,7 @@ handle_ticket_dispatch(
 				respond_json(msg, 400, emsg);
 				return;
 			}
+			cache_invalidate();
 			{
 				/* CRIT-2: build SSE event with JsonBuilder */
 				g_autofree gchar *ev = build_sse_event_json(
@@ -3554,6 +3632,7 @@ handle_ticket_dispatch(
 				respond_json(msg, 400, emsg);
 				return;
 			}
+			cache_invalidate();
 			{
 				/* CRIT-2: build SSE event with JsonBuilder */
 				g_autofree gchar *ev = build_sse_event_json(
@@ -3635,6 +3714,7 @@ handle_ticket_dispatch(
 					stderr_str ? stderr_str : "Failed to edit ticket");
 				respond_json(msg, 400, emsg);
 			} else {
+				cache_invalidate();
 				/* CRIT-2: build SSE event with JsonBuilder */
 				g_autofree gchar *ev = build_sse_event_json(
 					"ticket_id", ticket_id,
@@ -3667,6 +3747,7 @@ handle_ticket_dispatch(
 			respond_json(msg, 400, emsg);
 			return;
 		}
+		cache_invalidate();
 		{
 			/* CRIT-2: build SSE event with JsonBuilder */
 			g_autofree gchar *ev = build_sse_event_json(
@@ -3731,6 +3812,7 @@ handle_ticket_dispatch(
 				respond_json(msg, 400, emsg);
 				return;
 			}
+			cache_invalidate();
 			/* CRIT-1: build success response with JsonBuilder */
 			{
 				g_autofree gchar *link_msg = g_strdup_printf("Linked %s to %s", ticket_id, target);
@@ -3786,7 +3868,7 @@ handle_search(
 	{
 		const gchar *argv[] = { "search", q_val, "-f", "json", NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_free(err_out);
 
@@ -3852,7 +3934,7 @@ handle_dashboard(
 	{
 		const gchar *argv[] = { "dashboard", dash_type, NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_free(err_out);
 
@@ -3922,7 +4004,7 @@ handle_kanban(
 		if (project && *project) { g_ptr_array_add(args, (gpointer)"-P"); g_ptr_array_add(args, project); }
 		g_ptr_array_add(args, NULL);
 
-		rc = vimban_cmd(app, (const gchar * const *)args->pdata,
+		rc = vimban_cmd_cached(app, (const gchar * const *)args->pdata,
 		                CMD_TIMEOUT_SEC, &out, &err_out);
 		stdout_str = out;
 		g_free(err_out);
@@ -4059,7 +4141,7 @@ handle_people(
 	{
 		const gchar *argv[] = { "people", "list", "-f", "json", NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_free(err_out);
 
@@ -4131,7 +4213,7 @@ handle_person_dispatch(
 		argv[4] = "json";
 		argv[5] = NULL;
 
-		rc = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		rc = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		stdout_str = out;
 		g_free(err_out);
 
@@ -4200,6 +4282,7 @@ handle_person_dispatch(
 					stderr_str ? stderr_str : "Failed to create person");
 				respond_json(msg, 400, emsg);
 			} else {
+				cache_invalidate();
 				respond_json(msg, 200, "{\"success\":true}");
 			}
 		}
@@ -4241,7 +4324,7 @@ handle_projects(
 	{
 		const gchar *argv[] = { "list", "-f", "json", NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_free(err_out);
 
@@ -4410,6 +4493,7 @@ handle_commit(
 			return;
 		}
 
+		cache_invalidate();
 		{
 			g_autoptr(JsonBuilder) b = json_builder_new();
 			g_autoptr(JsonNode) root = NULL;
@@ -4460,7 +4544,7 @@ handle_validate(
 	{
 		const gchar *argv[] = { "validate", "-f", "json", NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_autofree gchar *stderr_str = err_out;
 
@@ -4822,7 +4906,7 @@ handle_mentor(
 		}
 		g_ptr_array_add(args, NULL);
 
-		rc = vimban_cmd(app, (const gchar * const *)args->pdata,
+		rc = vimban_cmd_cached(app, (const gchar * const *)args->pdata,
 		                CMD_TIMEOUT_SEC, &out, &err_out);
 		stdout_str = out;
 		g_free(err_out);
@@ -4897,6 +4981,7 @@ handle_mentor(
 			respond_json(msg, 400, emsg);
 			return;
 		}
+		cache_invalidate();
 		respond_json(msg, 200, "{\"success\":true}");
 		return;
 	}
@@ -4946,7 +5031,7 @@ handle_generate_link(
 	{
 		const gchar *argv[] = { "generate-link", ref, NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_autofree gchar *stderr_str = err_out;
 
@@ -5047,6 +5132,7 @@ handle_convert(
 		g_autofree gchar *stdout_str = out;
 		g_autofree gchar *stderr_str = err_out;
 
+		if (rc == 0) cache_invalidate();
 		{
 			g_autoptr(JsonBuilder) b = json_builder_new();
 			g_autoptr(JsonNode) root = NULL;
@@ -5117,7 +5203,7 @@ handle_report(
 	{
 		const gchar *argv_json[] = { "report", report_type, "-f", "json", NULL };
 		gchar *out = NULL, *err_out = NULL;
-		gint   rc  = vimban_cmd(app, argv_json, CMD_TIMEOUT_SEC, &out, &err_out);
+		gint   rc  = vimban_cmd_cached(app, argv_json, CMD_TIMEOUT_SEC, &out, &err_out);
 		g_autofree gchar *stdout_str = out;
 		g_free(err_out);
 
@@ -5154,7 +5240,7 @@ handle_report(
 		{
 			const gchar *argv_txt[] = { "report", report_type, NULL };
 			gchar *out2 = NULL, *err2 = NULL;
-			gint   rc2  = vimban_cmd(app, argv_txt, CMD_TIMEOUT_SEC, &out2, &err2);
+			gint   rc2  = vimban_cmd_cached(app, argv_txt, CMD_TIMEOUT_SEC, &out2, &err2);
 			g_autofree gchar *stdout2 = out2;
 			g_free(err2);
 
@@ -5229,6 +5315,7 @@ handle_sync(
 		stderr_str = err_out;
 	}
 
+	if (rc == 0) cache_invalidate();
 	resp = build_error_json(rc == 0,
 		rc == 0 ? "Sync complete" : (stderr_str && *stderr_str ? stderr_str : "Sync failed"));
 	respond_json(msg, 200, resp);
@@ -5282,7 +5369,7 @@ handle_snapshot(
 		g_autofree gchar *stderr_str = NULL;
 		guint i;
 
-		rc = vimban_cmd(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
+		rc = vimban_cmd_cached(app, argv, CMD_TIMEOUT_SEC, &out, &err_out);
 		stdout_str = out;
 		stderr_str = err_out;
 
@@ -5536,6 +5623,9 @@ main(
 			        app->token_file);
 		}
 	}
+
+	/* ── Command cache ─────────────────────────────────────────────── */
+	cache_init();
 
 	/* ── SoupServer setup ───────────────────────────────────────────── */
 	app->server = soup_server_new(NULL, NULL);
